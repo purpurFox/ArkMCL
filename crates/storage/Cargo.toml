@@ -1,0 +1,20 @@
+[package]
+name = "arkmcl-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ArkMCL 基础设施：文件系统、实例仓储与软链接"
+
+[lints]
+workspace = true
+
+[dependencies]
+arkmcl-core = { path = "../core" }
+arkmcl-platform = { path = "../platform" }
+md5 = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+ureq = { version = "2", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

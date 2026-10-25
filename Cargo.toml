@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/l10n",
+    "crates/platform",
+    "crates/storage",
+    "crates/cli",
+    "crates/service",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
