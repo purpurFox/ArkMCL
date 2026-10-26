@@ -174,12 +174,6 @@ impl<F: FileSystem> Fetcher<F> {
     /// 网络失败且无可用缓存、JSON 非法或缓存写入失败时返回错误。
     pub fn manifest(&self) -> Result<Manifest, Error> {
         let path = self.cache.manifest_path();
-        // 旧版把清单放在 assets/ 根目录；首次读取时迁移到 assets/indexes/。
-        if !self.cache.manifest_exists() {
-            if let Some(legacy) = self.cache.legacy_manifest()? {
-                self.cache.save_manifest(&legacy)?;
-            }
-        }
         self.cached_json(MANIFEST_URL, &path, Some(ttl()))
     }
 

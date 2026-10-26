@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// 实例标识。
 ///
-/// 只允许小写字母、数字与连字符，最长 64 字符。
+/// 允许 ASCII 可见字符，但禁止通配符、路径分隔符、平台保留字符与空白；
+/// 不得为 `.` 或 `..`，且最长 64 字符。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Id(String);
@@ -21,6 +22,8 @@ pub enum IdError {
     TooLong,
     /// 含非法字符。
     Invalid(char),
+    /// 保留名称。
+    Reserved,
 }
 
 impl fmt::Display for IdError {
@@ -34,6 +37,7 @@ impl fmt::Display for IdError {
                     "instance id contains invalid character '{character}'"
                 )
             }
+            Self::Reserved => formatter.write_str("instance id is reserved"),
         }
     }
 }
@@ -45,7 +49,7 @@ impl Id {
     ///
     /// # Errors
     ///
-    /// 为空、过长或包含非法字符时返回错误。
+    /// 为空、过长、为保留名称或包含非法字符时返回错误。
     pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
         let value = value.into();
         if value.is_empty() {
@@ -54,8 +58,17 @@ impl Id {
         if value.len() > 64 {
             return Err(IdError::TooLong);
         }
+        if value == "." || value == ".." {
+            return Err(IdError::Reserved);
+        }
         if let Some(character) = value.chars().find(|character| {
-            !(character.is_ascii_lowercase() || character.is_ascii_digit() || *character == '-')
+            !character.is_ascii()
+                || character.is_ascii_control()
+                || character.is_ascii_whitespace()
+                || matches!(
+                    character,
+                    '*' | '?' | '/' | '\\' | ':' | '"' | '<' | '>' | '|'
+                )
         }) {
             return Err(IdError::Invalid(character));
         }
@@ -125,8 +138,11 @@ pub const DEFAULT_JVM_ARGS: [&str; 20] = [
 pub struct Config {
     /// 最大堆内存（MiB）。
     pub memory_mb: u32,
-    /// 覆盖全局 Java 路径。
+    /// 覆盖全局 Java 路径（JDK 根目录或 java 可执行文件）。
     pub java_path: Option<PathBuf>,
+    /// 指定 Java 主版本；为空时使用游戏版本建议的版本。
+    #[serde(default)]
+    pub java_version: Option<u32>,
     /// 覆盖 LWJGL 版本；为空时使用版本 JSON 中的默认值。
     #[serde(default)]
     pub lwjgl: Option<String>,
@@ -145,6 +161,7 @@ impl Default for Config {
         Self {
             memory_mb: 4096,
             java_path: None,
+            java_version: None,
             lwjgl: None,
             jvm_args: DEFAULT_JVM_ARGS
                 .iter()
@@ -433,9 +450,16 @@ mod tests {
     #[test]
     fn validates_ids() {
         assert!(Id::new("my-instance-1").is_ok());
+        assert!(Id::new("test-1.17.1").is_ok());
+        assert!(Id::new("Upper").is_ok());
         assert_eq!(Id::new(""), Err(IdError::Empty));
-        assert_eq!(Id::new("Upper"), Err(IdError::Invalid('U')));
         assert_eq!(Id::new("a".repeat(65)), Err(IdError::TooLong));
+        assert_eq!(Id::new("你好"), Err(IdError::Invalid('你')));
+        assert_eq!(Id::new("a*b"), Err(IdError::Invalid('*')));
+        assert_eq!(Id::new("a/b"), Err(IdError::Invalid('/')));
+        assert_eq!(Id::new("a b"), Err(IdError::Invalid(' ')));
+        assert_eq!(Id::new("."), Err(IdError::Reserved));
+        assert_eq!(Id::new(".."), Err(IdError::Reserved));
     }
 
     #[test]

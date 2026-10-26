@@ -166,11 +166,10 @@ $MINECRAFT_HOME/                    # 默认 ~/.minecraft
 - 过期后用 `If-None-Match` / `If-Modified-Since` 校验；`304` 只更新时间戳。
 - 网络失败但存在旧缓存时回退旧内容，并在 `launch.prepare` 结果中返回 `"stale": true`。
 - `ARKMCL_META_TTL` 可覆盖 TTL（秒；`0` 表示永不过期）。
-- 升级兼容：旧版 `assets/version_manifest_v2.json` 首次读取时复制到新位置；旧的 `assets/loaders/fabric/` 不再读取，按需重新抓取。
 
 ### 下载行为
 
-- 默认 4 个并发，范围 `1..=8`；`ARKMCL_DOWNLOAD_CONCURRENCY` 可覆盖。
+- 默认 8 个下载线程，范围 `1..=64`；由 `launch --prepare-download-threads` 控制。
 - 临时文件为 `<目标文件>.part`；中断后按 `Range: bytes=<已下载长度>-` 续传，服务器不支持时自动从头重下。
 - 失败按 250ms 起倍增退避重试，最多 4 次；`429`/`5xx`、连接重置与超时可重试，`404`/`403` 不重试。
 - 校验失败或超过大小上限时删除 `.part` 后重试。
@@ -195,16 +194,16 @@ $ARKMCL_RUNTIME_DIR/
 - 内存：默认 4096 MiB；client ≥ 512，server ≥ 256
 - JVM 参数：默认 Aikar's flags；`--jvm-args default|none|"<args>"`
 - 分组：默认 `<loader>`
-- `--create-defaults <bool>` 控制是否复制默认配置（默认 true）
+- `--create-defaults [<bool>]` 控制是否复制默认配置（默认 true）；不带选择器时读写全局默认，带选择器时不可用
 - `--move <to>` 修改实例 ID（即目录名）
 
 全局默认项保存在 `settings.json` 的 `instance` 字段，缺省时使用内置值（4096 MiB、Aikar's flags），已有值不会被替换。
 
-不带实例选择器时：`--version|--memory|--jvm-args|--group <值>` 修改全局默认；这些选项不带值则输出当前全局值。带选择器时，上述选项以及 `--name`、`--loader`、`--loader-version`、`--lwjgl`、`--type`、`--account`、`--group` 不带值会输出该实例的当前设置；其中 `loader`、`loader-version`、`lwjgl`、`account`、`type`、`name` 不能作为全局默认项。
+不带实例选择器时：`--version|--memory|--jvm-args|--group|--type|--loader|--create-defaults <值>` 修改全局默认；这些选项不带值则输出当前全局值。带选择器时，上述选项以及 `--name`、`--loader-version`、`--lwjgl`、`--account` 不带值会输出该实例的当前设置；其中 `type`、`create-defaults` 只能在创建时或作为全局默认项使用，`name`、`loader-version`、`lwjgl`、`account` 不能作为全局默认项。
 
 ## 实例软链接策略
 
-`arkmcl instance <id> --type <client|server>` 决定可用链接项；`--linking` 只接受该类型支持的名称。
+`arkmcl instance <id> --type <client|server>` 决定可用链接项；`--link` 只接受该类型支持的名称。
 
 ### client
 
@@ -240,7 +239,7 @@ $ARKMCL_RUNTIME_DIR/
 
 所有链接一律使用**相对路径**，移动整个数据目录后仍然有效。
 
-`arkmcl instance <id> --linking <all|none|名称列表>` 用于显式创建或移除链接；不带值时输出当前状态（linked/real/missing/foreign）。创建时可用 `--linking all|none` 控制是否建立默认链接；未指定时使用全局默认（默认 `all`）。不带选择器的 `--linking all|none` 修改该全局默认：
+`arkmcl instance <id> --link <all|none|名称列表>` 用于显式创建或移除链接；不带值时输出当前状态（linked/real/missing/foreign）。创建时可用 `--link all|none` 控制是否建立默认链接；未指定时使用全局默认（默认 `all`）。不带选择器的 `--link all|none` 修改该全局默认：
 
 - `all`：创建全部默认链接；
 - `none`：移除所有指向全局目标的链接；

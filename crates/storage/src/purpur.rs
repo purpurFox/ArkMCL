@@ -106,6 +106,7 @@ pub fn install(
     target: &Path,
     downloader: &Downloader,
     progress: &dyn Progress,
+    threads: usize,
 ) -> Result<(), Error> {
     let url = format!("{BASE}/{minecraft}/{build}/download");
     let task = Task {
@@ -114,7 +115,7 @@ pub fn install(
         sha1: String::new(),
     };
     downloader
-        .run_with(&[task], Mode::Overwrite, progress)
+        .run_with_threads(&[task], Mode::Overwrite, progress, threads)
         .map_err(|error| Error::Download(error.to_string()))?;
     Ok(())
 }

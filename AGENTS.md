@@ -96,6 +96,13 @@ RustRover MCP 是**补充能力**，不是项目事实来源，也不是唯一�
 - 语义优先：重排导致中心词或修饰关系改变时，保留原名。
 - 方法、变量、参数、局部名、模块名不适用此规则，保持常规命名。
 - 词频快照与例外记录见 `docs/guide/naming/zh-CN.md`；不得按实时词频临时改名。
+- CLI 动作名、RPC 方法名与内部处理函数名应使用同一词根；跨入口前缀可调整，但不得错位。例如：`service stop` ↔ `server.stop` ↔ `server_stop`，`instance --info` ↔ `instance.info` ↔ `instance_info`，`resource --download` ↔ `resource.download` ↔ `resource_download`。
+
+### 3.5 配置文件字段顺序
+
+- 所有配置文件中的对象字段统一按以下顺序排列：`id`、`default`（含 `default_*` 前缀）、其余非时间字段按字母升序、时间相关字段最后。
+- 时间相关字段包括 `*_at`、`run_seconds` 等；时间组内部按字母升序。
+- 适用于 JSON 配置与 `instance.cfg`；新增字段时同步调整序列化顺序。
 
 ## 4. 跨平台策略
 

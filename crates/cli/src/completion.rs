@@ -21,7 +21,7 @@ _arkmcl_complete() {
             COMPREPLY=( $(compgen -W "fabric forge neoforge purpur" -- "$cur") ); return ;;
         --loader)
             if [ "$cmd" = "instance" ]; then
-                COMPREPLY=( $(compgen -W "fabric forge neoforge" -- "$cur") )
+                COMPREPLY=( $(compgen -W "fabric forge neoforge purpur none" -- "$cur") )
             else
                 COMPREPLY=( $(compgen -W "fabric forge neoforge purpur" -- "$cur") )
             fi
@@ -33,11 +33,11 @@ _arkmcl_complete() {
                 COMPREPLY=( $(compgen -W "worlds resourcepacks datapacks shaderpacks mods plugins modpacks" -- "$cur") )
             fi
             return ;;
-        --list-type) COMPREPLY=( $(compgen -W "mod modpack resourcepack shader datapack plugin world" -- "$cur") ); return ;;
-        --linking) COMPREPLY=( $(compgen -W "all none" -- "$cur") ); return ;;
+        --link) COMPREPLY=( $(compgen -W "all none" -- "$cur") ); return ;;
         --create-defaults) COMPREPLY=( $(compgen -W "true false" -- "$cur") ); return ;;
         --jvm-args) COMPREPLY=( $(compgen -W "default none" -- "$cur") ); return ;;
         --lwjgl) COMPREPLY=( $(compgen -W "default" -- "$cur") ); return ;;
+        --java) COMPREPLY=( $(compgen -W "default" -- "$cur") ); return ;;
         --list-sort) COMPREPLY=( $(compgen -W "asc desc" -- "$cur") ); return ;;
         --list-sort-by)
             if [ "$cmd" = "resource" ]; then
@@ -45,7 +45,7 @@ _arkmcl_complete() {
                     COMPREPLY=( $(compgen -W "create download name relevance" -- "$cur") )
                 elif [[ " ${COMP_WORDS[*]} " == *" --list-remote "* ]]; then
                     COMPREPLY=( $(compgen -W "create launch alphabet" -- "$cur") )
-                elif [[ " ${COMP_WORDS[*]} " == *" --search "* || " ${COMP_WORDS[*]} " == *" --list-search "* ]]; then
+                elif [[ " ${COMP_WORDS[*]} " == *" --search "* ]]; then
                     COMPREPLY=( $(compgen -W "create download name relevance" -- "$cur") )
                 else
                     COMPREPLY=( $(compgen -W "create alphabet" -- "$cur") )
@@ -69,10 +69,10 @@ _arkmcl_complete() {
 
     if [[ "$cur" == -* ]]; then
         case "$cmd" in
-            account) COMPREPLY=( $(compgen -W "--add --default --json --lang --list --list-sort --list-sort-by --refresh --remove --server --yes" -- "$cur") ) ;;
-            instance) COMPREPLY=( $(compgen -W "--account --create --create-defaults --default --group --group-move --import --info --json --lang --linking --list --list-sort --list-sort-by --loader --loader-version --lwjgl --memory --move --name --remove --type --version --yes" -- "$cur") ) ;;
-            launch) COMPREPLY=( $(compgen -W "--account --json --lang --list --list-sort --list-sort-by --prepare --start --stop --terminal --yes" -- "$cur") ) ;;
-            resource) COMPREPLY=( $(compgen -W "--api --autoremove --download --download-datapack --download-mod --download-modpack --download-plugin --download-resourcepack --download-shader --download-to-instance --download-version --download-world --filter-loader --filter-vanilla --filter-version --game-version --json --lang --list --list-download-to-instance --list-limit --list-remote --list-search --list-sort --list-sort-by --list-type --loader --lookup --search --type --yes" -- "$cur") ) ;;
+            account) COMPREPLY=( $(compgen -W "--add --default --info --json --lang --list --list-sort --list-sort-by --refresh --remove --server --yes" -- "$cur") ) ;;
+            instance) COMPREPLY=( $(compgen -W "--account --create --create-defaults --default --group --group-move --import --info --java --json --lang --link --list --list-sort --list-sort-by --loader --loader-version --lwjgl --memory --move --name --remove --type --version --yes" -- "$cur") ) ;;
+            launch) COMPREPLY=( $(compgen -W "--json --lang --list --list-sort --list-sort-by --prepare --prepare-download-threads --start --stop --terminal --yes" -- "$cur") ) ;;
+            resource) COMPREPLY=( $(compgen -W "--api --autoremove --download --download-datapack --download-mod --download-modpack --download-plugin --download-resourcepack --download-shader --download-to-instance --download-version --download-world --filter-loader --filter-vanilla --filter-version --game-version --json --lang --list --list-download-to-instance --list-limit --list-remote --list-sort --list-sort-by --loader --lookup --search --type --yes" -- "$cur") ) ;;
             service) COMPREPLY=( $(compgen -W "--lang" -- "$cur") ) ;;
             completion) COMPREPLY=( $(compgen -W "bash zsh fish" -- "$cur") ) ;;
         esac
@@ -109,7 +109,7 @@ _arkmcl() {
         --filter-loader) compadd fabric forge neoforge purpur; return ;;
         --loader)
             if [[ "$cmd" == instance ]]; then
-                compadd fabric forge neoforge
+                compadd fabric forge neoforge purpur none
             else
                 compadd fabric forge neoforge purpur
             fi
@@ -121,11 +121,11 @@ _arkmcl() {
                 compadd worlds resourcepacks datapacks shaderpacks mods plugins modpacks
             fi
             return ;;
-        --list-type) compadd mod modpack resourcepack shader datapack plugin world; return ;;
-        --linking) compadd all none; return ;;
+        --link) compadd all none; return ;;
         --create-defaults) compadd true false; return ;;
         --jvm-args) compadd default none; return ;;
         --lwjgl) compadd default; return ;;
+        --java) compadd default; return ;;
         --list-sort) compadd asc desc; return ;;
         --list-sort-by)
             if [[ "$cmd" == resource ]]; then
@@ -133,7 +133,7 @@ _arkmcl() {
                     compadd create download name relevance
                 elif [[ "${words[*]}" == *--list-remote* ]]; then
                     compadd create launch alphabet
-                elif [[ "${words[*]}" == *--search* || "${words[*]}" == *--list-search* ]]; then
+                elif [[ "${words[*]}" == *--search* ]]; then
                     compadd create download name relevance
                 else
                     compadd create alphabet
@@ -157,10 +157,10 @@ _arkmcl() {
 
     if [[ "$cur" == -* ]]; then
         case "$cmd" in
-            account) compadd -- --add --default --json --lang --list --list-sort --list-sort-by --refresh --remove --server --yes ;;
-            instance) compadd -- --account --create --create-defaults --default --group --group-move --import --info --json --lang --linking --list --list-sort --list-sort-by --loader --loader-version --lwjgl --memory --move --name --remove --type --version --yes ;;
-            launch) compadd -- --account --json --lang --list --list-sort --list-sort-by --prepare --start --stop --terminal --yes ;;
-            resource) compadd -- --api --autoremove --download --download-datapack --download-mod --download-modpack --download-plugin --download-resourcepack --download-shader --download-to-instance --download-version --download-world --filter-loader --filter-vanilla --filter-version --game-version --json --lang --list --list-download-to-instance --list-limit --list-remote --list-search --list-sort --list-sort-by --list-type --loader --lookup --search --type --yes ;;
+            account) compadd -- --add --default --info --json --lang --list --list-sort --list-sort-by --refresh --remove --server --yes ;;
+            instance) compadd -- --account --create --create-defaults --default --group --group-move --import --info --java --json --lang --link --list --list-sort --list-sort-by --loader --loader-version --lwjgl --memory --move --name --remove --type --version --yes ;;
+            launch) compadd -- --json --lang --list --list-sort --list-sort-by --prepare --prepare-download-threads --start --stop --terminal --yes ;;
+            resource) compadd -- --api --autoremove --download --download-datapack --download-mod --download-modpack --download-plugin --download-resourcepack --download-shader --download-to-instance --download-version --download-world --filter-loader --filter-vanilla --filter-version --game-version --json --lang --list --list-download-to-instance --list-limit --list-remote --list-sort --list-sort-by --loader --lookup --search --type --yes ;;
             service) compadd -- --lang ;;
             completion) compadd bash zsh fish ;;
         esac
@@ -201,6 +201,7 @@ complete -c arkmcl -n '__fish_seen_subcommand_from account' -l list -d 'List acc
 complete -c arkmcl -n '__fish_seen_subcommand_from account' -l add -d 'Add account'
 complete -c arkmcl -n '__fish_seen_subcommand_from account' -l remove -d 'Remove accounts'
 complete -c arkmcl -n '__fish_seen_subcommand_from account' -l default -d 'Set default account'
+complete -c arkmcl -n '__fish_seen_subcommand_from account' -l info -d 'Print account info'
 complete -c arkmcl -n '__fish_seen_subcommand_from account' -l refresh -d 'Refresh tokens'
 complete -c arkmcl -n '__fish_seen_subcommand_from account' -l server -r -d 'External server'
 complete -c arkmcl -n '__fish_seen_subcommand_from account' -l list-sort -x -a 'asc desc'
@@ -229,13 +230,14 @@ complete -c arkmcl -n '__fish_seen_subcommand_from instance' -l remove -d 'Remov
 complete -c arkmcl -n '__fish_seen_subcommand_from instance' -l type -x -a 'client server' -d 'Instance type'
 complete -c arkmcl -n '__fish_seen_subcommand_from instance' -l version -r -d 'Minecraft version'
 complete -c arkmcl -n '__fish_seen_subcommand_from instance' -l jvm-args -x -a 'default none' -d 'JVM arguments'
+complete -c arkmcl -n '__fish_seen_subcommand_from instance' -l java -x -a 'default' -d 'Java selection'
 complete -c arkmcl -n '__fish_seen_subcommand_from instance' -a '(arkmcl complete instance-names 2>/dev/null)'
 
-complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l account -x -a '(arkmcl complete account-names 2>/dev/null)'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l list -d 'List running instances'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l list-sort -x -a 'asc desc'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l list-sort-by -x -a 'create launch run alphabet'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l prepare -d 'Prepare resources'
+complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l prepare-download-threads -r -d 'Download threads'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l start -d 'Start instance'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l stop -d 'Force-terminate instances'
 complete -c arkmcl -n '__fish_seen_subcommand_from launch' -l terminal -d 'Attach console'
@@ -261,10 +263,8 @@ complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list -d 'List lo
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-download-to-instance -x -a '(arkmcl complete instance-ids 2>/dev/null)'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-limit -r -d 'Result limit'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-remote -d 'Remote versions'
-complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-search -r -d 'Search query'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-sort -x -a 'asc desc'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-sort-by -x -a 'create launch alphabet download name relevance'
-complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l list-type -x -a 'mod modpack resourcepack shader datapack plugin world'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l loader -x -a 'fabric forge neoforge purpur'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l lookup -r -d 'Project versions'
 complete -c arkmcl -n '__fish_seen_subcommand_from resource' -l search -r -d 'Community search'

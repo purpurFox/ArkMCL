@@ -58,14 +58,12 @@ pub enum Kind {
 /// 账户元数据。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
-    /// 账户标识。
+    /// 账户标识（游戏 UUID）。
     pub id: AccountId,
     /// 账户类型。
     pub kind: Kind,
     /// 显示名称。
     pub name: String,
-    /// 游戏 UUID。
-    pub uuid: String,
     /// 外置认证服务器。
     #[serde(default)]
     pub server: Option<String>,
@@ -78,6 +76,51 @@ pub struct Account {
     /// 累计运行秒数。
     #[serde(default)]
     pub run_seconds: u64,
+}
+
+/// `accounts.json` 中的账户记录。
+///
+/// 文件保存 `id`。
+#[derive(Debug, Serialize, Deserialize)]
+struct AccountRecord {
+    id: String,
+    kind: Kind,
+    name: String,
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    last_used_at: Option<u64>,
+    #[serde(default)]
+    run_seconds: u64,
+}
+
+impl AccountRecord {
+    fn from_account(account: &Account) -> Self {
+        Self {
+            id: account.id.as_str().to_owned(),
+            kind: account.kind,
+            name: account.name.clone(),
+            server: account.server.clone(),
+            created_at: account.created_at,
+            last_used_at: account.last_used_at,
+            run_seconds: account.run_seconds,
+        }
+    }
+
+    fn into_account(self) -> Result<Account, Error> {
+        let id = AccountId::new(self.id).map_err(|_| Error::InvalidId)?;
+        Ok(Account {
+            id,
+            kind: self.kind,
+            name: self.name,
+            server: self.server,
+            created_at: self.created_at,
+            last_used_at: self.last_used_at,
+            run_seconds: self.run_seconds,
+        })
+    }
 }
 
 /// 账户错误。
@@ -140,7 +183,7 @@ impl std::error::Error for Error {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct File {
     #[serde(default)]
-    accounts: Vec<Account>,
+    accounts: Vec<AccountRecord>,
 }
 
 /// 账户存储。
@@ -173,7 +216,10 @@ impl<F: FileSystem> Store<F> {
             path: self.path.clone(),
             source,
         })?;
-        Ok(file.accounts)
+        file.accounts
+            .into_iter()
+            .map(AccountRecord::into_account)
+            .collect()
     }
 
     /// 按标识读取账户。
@@ -241,7 +287,7 @@ impl<F: FileSystem> Store<F> {
 
     fn save(&self, accounts: &[Account]) -> Result<(), Error> {
         let file = File {
-            accounts: accounts.to_vec(),
+            accounts: accounts.iter().map(AccountRecord::from_account).collect(),
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|source| Error::Json {
             path: self.path.clone(),
@@ -339,7 +385,6 @@ mod tests {
             id: AccountId::new(offline_uuid("Player")).expect("id"),
             kind: Kind::Offline,
             name: "Player".to_owned(),
-            uuid: offline_uuid("Player"),
             server: None,
             created_at: 0,
             last_used_at: None,
@@ -354,6 +399,44 @@ mod tests {
     }
 
     #[test]
+    fn writes_id_without_uuid() {
+        let directory = temp_dir("id-only");
+        let store = Store::new(directory.join("accounts.json"), LocalFileSystem);
+        let uuid = offline_uuid("Player");
+        let account = Account {
+            id: AccountId::new(uuid.clone()).expect("id"),
+            kind: Kind::Offline,
+            name: "Player".to_owned(),
+            server: None,
+            created_at: 0,
+            last_used_at: None,
+            run_seconds: 0,
+        };
+        store.add(&account).expect("add");
+        let text = fs::read_to_string(directory.join("accounts.json")).expect("read");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let entry = &value["accounts"][0];
+        assert!(entry.get("uuid").is_none());
+        assert_eq!(entry["id"], uuid);
+        let keys = [
+            "id",
+            "kind",
+            "name",
+            "server",
+            "created_at",
+            "last_used_at",
+            "run_seconds",
+        ];
+        let mut last = 0;
+        for key in keys {
+            let position = text.find(&format!("\"{key}\"")).expect(key);
+            assert!(position >= last, "field order: {key}");
+            last = position;
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn rejects_invalid_server() {
         let directory = temp_dir("server");
         let store = Store::new(directory.join("accounts.json"), LocalFileSystem);
@@ -361,7 +444,6 @@ mod tests {
             id: AccountId::new("id").expect("id"),
             kind: Kind::External,
             name: "Player".to_owned(),
-            uuid: offline_uuid("Player"),
             server: Some("ftp://example.com".to_owned()),
             created_at: 0,
             last_used_at: None,

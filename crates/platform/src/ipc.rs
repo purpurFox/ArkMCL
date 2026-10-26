@@ -19,6 +19,12 @@ pub const INTERNAL_ERROR: i32 = -32603;
 /// 单条消息上限。
 const MAX_MESSAGE: usize = 1024 * 1024;
 
+/// 当前 JSON-RPC 协议主版本。
+///
+/// 破坏性变更（删除/重命名方法、改变参数或结果语义）必须递增；
+/// 新增字段或新增方法不递增。客户端应在首次连接时通过 "server.info" 校验。
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// JSON-RPC 请求。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {

@@ -53,6 +53,11 @@ use serde_json::{Value, json};
 
 const MAX_MESSAGE: usize = 1024 * 1024;
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+const DEFAULT_DOWNLOAD_THREADS: usize = 8;
+const MAX_DOWNLOAD_THREADS: usize = 64;
+
+/// 服务端能力列表，供客户端做功能探测。
+const CAPABILITIES: [&str; 5] = ["account", "instance", "launch", "resource", "settings"];
 
 /// 服务端错误。
 #[derive(Debug)]
@@ -337,7 +342,7 @@ fn report_runtime_error(catalog: &Catalog, error: &Error) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// 运行服务端，直到收到 `server.shutdown`。
+/// 运行服务端，直到收到 `server.stop`。
 ///
 /// # Errors
 ///
@@ -455,6 +460,31 @@ fn handle_client(
     Ok(())
 }
 
+fn server_info(request: &Request, paths: &Paths, catalog: &Catalog) -> Response {
+    Response::result(
+        request.id.clone(),
+        json!({
+            "name": APP_NAME,
+            "version": VERSION,
+            "protocol": arkmcl_platform::ipc::PROTOCOL_VERSION,
+            "capabilities": CAPABILITIES,
+            "pid": std::process::id(),
+            "locale": catalog.locale().tag(),
+            "portable": paths.portable,
+            "socket": paths.socket().display().to_string(),
+        }),
+    )
+}
+
+fn server_status(request: &Request, paths: &Paths, catalog: &Catalog) -> Response {
+    server_info(request, paths, catalog)
+}
+
+fn server_stop(request: &Request, stop: &AtomicBool) -> Response {
+    stop.store(true, Ordering::SeqCst);
+    Response::result(request.id.clone(), json!({"stopping": true}))
+}
+
 fn dispatch(
     request: &Request,
     paths: &Paths,
@@ -464,23 +494,12 @@ fn dispatch(
     sink: &(dyn Fn(Value) + Sync),
 ) -> Response {
     match request.method.as_str() {
-        "server.info" => Response::result(
-            request.id.clone(),
-            json!({
-                "name": APP_NAME,
-                "version": VERSION,
-                "pid": std::process::id(),
-                "locale": catalog.locale().tag(),
-                "portable": paths.portable,
-                "socket": paths.socket().display().to_string(),
-            }),
-        ),
-        "server.shutdown" => {
-            stop.store(true, Ordering::SeqCst);
-            Response::result(request.id.clone(), json!({"stopping": true}))
-        }
+        "server.info" => server_info(request, paths, catalog),
+        "server.status" => server_status(request, paths, catalog),
+        "server.stop" => server_stop(request, stop),
         "instance.list" => instance_list(request, services, catalog),
-        "instance.get" => instance_get(request, services, catalog),
+        "instance.info" => instance_info(request, services, catalog),
+        "instance.java" => instance_java(request, services, catalog),
         "instance.create" => instance_create(request, services, catalog),
         "instance.import" => instance_import(request, services, catalog, sink),
         "instance.update" => instance_update(request, services, catalog),
@@ -488,25 +507,25 @@ fn dispatch(
         "instance.links" => instance_links(request, services, catalog),
         "instance.move" => instance_move(request, services, catalog),
         "instance.group_move" => instance_group_move(request, services, catalog),
-        "instance.delete" => instance_delete(request, services, catalog),
+        "instance.remove" => instance_remove(request, services, catalog),
         "launch.prepare" => launch_prepare(request, services, catalog, sink),
         "launch.start" => launch_start(request, services, catalog),
         "launch.stop" => launch_stop(request, services, catalog),
-        "launch.status" => launch_status(request, services, catalog),
+        "launch.list" => launch_list(request, services, catalog),
+        "launch.terminal" => launch_terminal(request, services, catalog),
         "launch.output" => launch_output(request, services, catalog),
         "launch.input" => launch_input(request, services, catalog),
+        "account.info" => account_info(request, services, catalog),
         "account.list" => account_list(request, services, catalog),
         "account.add" => account_add(request, services, catalog),
         "account.remove" => account_remove(request, services, catalog),
         "account.default" => account_default(request, services, catalog),
         "account.refresh" => account_refresh(request, services, catalog),
-        "resource.versions" => resource_versions(request, services, catalog),
+        "resource.list_remote" => resource_list_remote(request, services, catalog),
         "resource.list" => resource_list(request, services, catalog),
         "resource.lookup" => resource_lookup(request, catalog),
-        "resource.install" | "resource.download" => {
-            resource_install(request, services, catalog, sink)
-        }
-        "resource.loaders" => resource_loaders(request, services, catalog),
+        "resource.download" => resource_download(request, services, catalog, sink),
+        "resource.list_remote_loaders" => resource_list_remote_loaders(request, services, catalog),
         "resource.search" => resource_search(request, catalog),
         "resource.autoremove" => resource_autoremove(request, services, catalog),
         "instance.default" => instance_default(request, services, catalog),
@@ -518,6 +537,24 @@ fn dispatch(
             METHOD_NOT_FOUND,
             catalog.format("rpc.method", &[("method", method)]),
         ),
+    }
+}
+
+fn download_threads(request: &Request, catalog: &Catalog) -> Result<usize, (i32, String)> {
+    match request.params.get("download_threads") {
+        None => Ok(DEFAULT_DOWNLOAD_THREADS),
+        Some(value) => {
+            let threads = value
+                .as_u64()
+                .and_then(|threads| usize::try_from(threads).ok());
+            match threads {
+                Some(threads) if (1..=MAX_DOWNLOAD_THREADS).contains(&threads) => Ok(threads),
+                _ => Err((
+                    INVALID_PARAMS,
+                    catalog.format("rpc.launch.threads", &[("value", &value.to_string())]),
+                )),
+            }
+        }
     }
 }
 
@@ -534,6 +571,10 @@ fn launch_prepare(
         Ok(instance) => instance,
         Err(error) => return response_error(request, catalog, "rpc.launch.prepare", &error),
     };
+    let threads = match download_threads(request, catalog) {
+        Ok(threads) => threads,
+        Err((code, message)) => return Response::fault(request.id.clone(), code, message),
+    };
     match arkmcl_storage::lock::Guard::check(&LocalFileSystem, &instance.root) {
         Ok(()) => {}
         Err(arkmcl_storage::lock::Error::Locked) => {
@@ -547,7 +588,7 @@ fn launch_prepare(
     }
 
     let (version_id, plan, downloads, natives) = if instance.kind == InstanceKind::Server {
-        let (plan, downloads) = match server_plan(&instance, services, catalog, sink) {
+        let (plan, downloads) = match server_plan(&instance, services, catalog, sink, threads) {
             Ok(result) => result,
             Err((code, message)) => return Response::fault(request.id.clone(), code, message),
         };
@@ -562,7 +603,8 @@ fn launch_prepare(
             Ok(version) => version,
             Err((code, message)) => return Response::fault(request.id.clone(), code, message),
         };
-        let (downloads, natives) = match prepare_content(&version, services, catalog, sink) {
+        let (downloads, natives) = match prepare_content(&version, services, catalog, sink, threads)
+        {
             Ok(result) => result,
             Err((code, message)) => return Response::fault(request.id.clone(), code, message),
         };
@@ -689,6 +731,7 @@ fn prepare_content(
     services: &Services,
     catalog: &Catalog,
     sink: &(dyn Fn(Value) + Sync),
+    threads: usize,
 ) -> Result<(DownloadReport, NativesReport), (i32, String)> {
     let wrap = |error: &dyn std::fmt::Display| {
         (
@@ -708,13 +751,18 @@ fn prepare_content(
     let progress = SinkProgress::new(sink);
     let downloads = services
         .downloader
-        .run_with(&tasks, DownloadMode::SkipExisting, &progress)
+        .run_with_threads(&tasks, DownloadMode::SkipExisting, &progress, threads)
         .map_err(|error| wrap(&error))?;
     let natives = services
         .extractor
         .extract(version, &context)
         .map_err(|error| wrap(&error))?;
     Ok((downloads, natives))
+}
+
+fn java_executable(path: &Path) -> PathBuf {
+    path.join("bin")
+        .join(format!("java{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[allow(clippy::too_many_lines)] // orchestration; split when more steps are added
@@ -725,13 +773,14 @@ fn build_plan(
     account: Option<&str>,
     catalog: &Catalog,
 ) -> Result<(Plan, Option<AccountId>), (i32, String)> {
+    let suggested = version
+        .java_version
+        .as_ref()
+        .map_or(8, |java| java.major_version);
+    let required = instance.config.java_version.unwrap_or(suggested);
     let java = if let Some(path) = instance.config.java_path.clone() {
-        path
+        java_executable(&path)
     } else {
-        let required = version
-            .java_version
-            .as_ref()
-            .map_or(8, |java| java.major_version);
         match arkmcl_storage::java::select(required) {
             Some(runtime) => runtime.path,
             None => {
@@ -778,7 +827,7 @@ fn build_plan(
         (
             User {
                 name: account.name,
-                uuid: account.uuid,
+                uuid: account.id.as_str().to_owned(),
                 access_token,
                 user_type: user_type.to_owned(),
             },
@@ -863,8 +912,12 @@ fn launch_start(request: &Request, services: &Arc<Services>, catalog: &Catalog) 
         Err(error) => return response_error(request, catalog, "rpc.launch.start", &error),
     };
 
+    let threads = match download_threads(request, catalog) {
+        Ok(threads) => threads,
+        Err((code, message)) => return Response::fault(request.id.clone(), code, message),
+    };
     let (plan, account_id, downloads, natives) = if instance.kind == InstanceKind::Server {
-        let (plan, downloads) = match server_plan(&instance, services, catalog, &no_sink) {
+        let (plan, downloads) = match server_plan(&instance, services, catalog, &no_sink, threads) {
             Ok(result) => result,
             Err((code, message)) => return Response::fault(request.id.clone(), code, message),
         };
@@ -874,10 +927,11 @@ fn launch_start(request: &Request, services: &Arc<Services>, catalog: &Catalog) 
             Ok(version) => version,
             Err((code, message)) => return Response::fault(request.id.clone(), code, message),
         };
-        let (downloads, natives) = match prepare_content(&version, services, catalog, &no_sink) {
-            Ok(result) => result,
-            Err((code, message)) => return Response::fault(request.id.clone(), code, message),
-        };
+        let (downloads, natives) =
+            match prepare_content(&version, services, catalog, &no_sink, threads) {
+                Ok(result) => result,
+                Err((code, message)) => return Response::fault(request.id.clone(), code, message),
+            };
         let (plan, account_id) = match build_plan(
             &instance,
             &version,
@@ -1002,7 +1056,7 @@ fn launch_stop(request: &Request, services: &Arc<Services>, catalog: &Catalog) -
     }
 }
 
-fn launch_status(request: &Request, services: &Arc<Services>, catalog: &Catalog) -> Response {
+fn launch_list(request: &Request, services: &Arc<Services>, catalog: &Catalog) -> Response {
     let Ok(sessions) = services.sessions.lock() else {
         return Response::fault(
             request.id.clone(),
@@ -1022,6 +1076,35 @@ fn launch_status(request: &Request, services: &Arc<Services>, catalog: &Catalog)
         })
         .collect();
     Response::result(request.id.clone(), json!(entries))
+}
+
+fn launch_terminal(request: &Request, services: &Arc<Services>, catalog: &Catalog) -> Response {
+    let Some(id) = instance_id(request) else {
+        return invalid_id(request, catalog);
+    };
+    let Ok(sessions) = services.sessions.lock() else {
+        return Response::fault(
+            request.id.clone(),
+            INTERNAL_ERROR,
+            catalog.text("rpc.launch.stop").to_owned(),
+        );
+    };
+    let Some(session) = sessions.get(&id) else {
+        return Response::fault(
+            request.id.clone(),
+            INVALID_PARAMS,
+            catalog.text("rpc.launch.not_running").to_owned(),
+        );
+    };
+    let pid = session.child.lock().ok().map(|child| child.id());
+    Response::result(
+        request.id.clone(),
+        json!({
+            "id": id.as_str(),
+            "pid": pid,
+            "started_at": session.started_at,
+        }),
+    )
 }
 
 fn launch_output(request: &Request, services: &Arc<Services>, catalog: &Catalog) -> Response {
@@ -1334,10 +1417,7 @@ fn resolve_account(services: &Services, catalog: &Catalog, value: &str) -> Resul
         .accounts
         .list()
         .map_err(|error| catalog.format("rpc.account.lookup", &[("error", &error.to_string())]))?;
-    if let Some(account) = accounts
-        .iter()
-        .find(|account| account.id.as_str() == value || account.uuid == value)
-    {
+    if let Some(account) = accounts.iter().find(|account| account.id.as_str() == value) {
         return Ok(account.clone());
     }
     let matches: Vec<&Account> = accounts
@@ -1348,12 +1428,12 @@ fn resolve_account(services: &Services, catalog: &Catalog, value: &str) -> Resul
         0 => Err(catalog.format("rpc.account.not_found", &[("value", value)])),
         1 => Ok(matches[0].clone()),
         _ => {
-            let uuids = matches
+            let ids = matches
                 .iter()
-                .map(|account| account.uuid.as_str())
+                .map(|account| account.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(catalog.format("rpc.account.ambiguous", &[("uuids", &uuids)]))
+            Err(catalog.format("rpc.account.ambiguous", &[("ids", &ids)]))
         }
     }
 }
@@ -1546,7 +1626,7 @@ fn resource_directory(kind: &str) -> Option<(&'static str, bool)> {
 }
 
 #[allow(clippy::too_many_lines)] // provider-specific install flow
-fn resource_install_curseforge(
+fn resource_download_curseforge(
     request: &Request,
     services: &Services,
     catalog: &Catalog,
@@ -1725,8 +1805,8 @@ fn resource_install_curseforge(
     )
 }
 
-#[allow(clippy::too_many_lines)] // install orchestration; split by type when more providers are added
-fn resource_install(
+#[allow(clippy::too_many_lines)] // download orchestration; split by type when more providers are added
+fn resource_download(
     request: &Request,
     services: &Services,
     catalog: &Catalog,
@@ -1746,7 +1826,7 @@ fn resource_install(
         );
     };
     if request.params.get("api").and_then(Value::as_str) == Some("curseforge") {
-        return resource_install_curseforge(request, services, catalog, sink, project);
+        return resource_download_curseforge(request, services, catalog, sink, project);
     }
     let client = ModrinthClient::new();
     let kind = match request.params.get("type").and_then(Value::as_str) {
@@ -2101,7 +2181,7 @@ fn resource_autoremove(request: &Request, services: &Services, _catalog: &Catalo
     )
 }
 
-fn resource_versions(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+fn resource_list_remote(request: &Request, services: &Services, catalog: &Catalog) -> Response {
     let manifest = match services.fetcher.manifest() {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -2222,7 +2302,11 @@ fn resource_lookup_curseforge(
 }
 
 #[allow(clippy::too_many_lines)] // loader matrix; split when more sources are added
-fn resource_loaders(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+fn resource_list_remote_loaders(
+    request: &Request,
+    services: &Services,
+    catalog: &Catalog,
+) -> Response {
     let Some(loader) = request
         .params
         .get("loader")
@@ -2656,6 +2740,24 @@ fn copy_dir(source: &std::path::Path, target: &std::path::Path) -> io::Result<()
     Ok(())
 }
 
+fn account_info(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+    let Some(raw) = request.params.get("id").and_then(Value::as_str) else {
+        return account_id_error(request, catalog);
+    };
+    let Ok(id) = AccountId::new(raw) else {
+        return account_id_error(request, catalog);
+    };
+    match services.accounts.get(&id) {
+        Ok(Some(account)) => Response::result(request.id.clone(), json!(account)),
+        Ok(None) => Response::fault(
+            request.id.clone(),
+            INVALID_PARAMS,
+            catalog.format("rpc.account.not_found", &[("value", raw)]),
+        ),
+        Err(error) => response_error(request, catalog, "rpc.account.lookup", &error),
+    }
+}
+
 fn account_list(request: &Request, services: &Services, catalog: &Catalog) -> Response {
     match services.accounts.list() {
         Ok(accounts) => Response::result(request.id.clone(), json!(accounts)),
@@ -2681,12 +2783,12 @@ fn account_add(request: &Request, services: &Services, catalog: &Catalog) -> Res
     let Some(name) = account_name(request, catalog) else {
         return account_name_error(request, catalog);
     };
-    let uuid = request
+    let id = request
         .params
-        .get("uuid")
+        .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|uuid| !uuid.is_empty())
+        .filter(|id| !id.is_empty())
         .map(str::to_owned);
     let server = request
         .params
@@ -2706,9 +2808,9 @@ fn account_add(request: &Request, services: &Services, catalog: &Catalog) -> Res
         .and_then(Value::as_str)
         .map(str::to_owned);
 
-    let (kind, uuid, server, token) = match kind {
+    let (kind, id, server, token) = match kind {
         "offline" => {
-            for field in ["uuid", "server", "access_token", "refresh_token"] {
+            for field in ["id", "server", "access_token", "refresh_token"] {
                 if request.params.get(field).is_some() {
                     return account_field_error(request, catalog, kind, field);
                 }
@@ -2731,7 +2833,7 @@ fn account_add(request: &Request, services: &Services, catalog: &Catalog) -> Res
             };
             (
                 Kind::External,
-                uuid.unwrap_or_else(|| offline_uuid(name)),
+                id.unwrap_or_else(|| offline_uuid(name)),
                 Some(server),
                 None,
             )
@@ -2740,10 +2842,10 @@ fn account_add(request: &Request, services: &Services, catalog: &Catalog) -> Res
             if request.params.get("server").is_some() {
                 return account_field_error(request, catalog, kind, "server");
             }
-            let Some(uuid) = uuid else {
+            let Some(id) = id else {
                 return account_id_error(request, catalog);
             };
-            (Kind::Microsoft, uuid, None, token)
+            (Kind::Microsoft, id, None, token)
         }
         other => {
             return Response::fault(
@@ -2754,14 +2856,13 @@ fn account_add(request: &Request, services: &Services, catalog: &Catalog) -> Res
         }
     };
 
-    let Ok(id) = AccountId::new(uuid.clone()) else {
+    let Ok(id) = AccountId::new(id) else {
         return account_id_error(request, catalog);
     };
     let account = Account {
         id,
         kind,
         name: name.to_owned(),
-        uuid,
         server,
         created_at: 0,
         last_used_at: None,
@@ -2940,6 +3041,12 @@ fn account_remove(request: &Request, services: &Services, catalog: &Catalog) -> 
                 tokens.remove(&id);
             }
             let _ = services.tokens_store.remove(id.as_str());
+            if let Ok(mut settings) = services.settings.load() {
+                if settings.default_account.as_deref() == Some(id.as_str()) {
+                    settings.default_account = None;
+                    let _ = services.settings.save(&settings);
+                }
+            }
             Response::result(request.id.clone(), json!({"deleted": true}))
         }
         Err(error) => response_error(request, catalog, "rpc.account.remove", &error),
@@ -3095,7 +3202,7 @@ fn account_default(request: &Request, services: &Services, catalog: &Catalog) ->
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return account_id_error(request, catalog);
+        return account_default_query(request, services, catalog);
     };
     let accounts = match services.accounts.list() {
         Ok(accounts) => accounts,
@@ -3103,7 +3210,7 @@ fn account_default(request: &Request, services: &Services, catalog: &Catalog) ->
     };
     let account = if let Some(account) = accounts
         .iter()
-        .find(|account| account.id.as_str() == value || account.uuid == value)
+        .find(|account| account.id.as_str() == value)
         .cloned()
     {
         account
@@ -3123,15 +3230,15 @@ fn account_default(request: &Request, services: &Services, catalog: &Catalog) ->
             }
             1 => matches.into_iter().next().expect("one match"),
             _ => {
-                let uuids = matches
+                let ids = matches
                     .iter()
-                    .map(|account| account.uuid.as_str())
+                    .map(|account| account.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Response::fault(
                     request.id.clone(),
                     INVALID_PARAMS,
-                    catalog.format("rpc.account.ambiguous", &[("uuids", &uuids)]),
+                    catalog.format("rpc.account.ambiguous", &[("ids", &ids)]),
                 );
             }
         }
@@ -3144,6 +3251,24 @@ fn account_default(request: &Request, services: &Services, catalog: &Catalog) ->
     settings.default_account = Some(account.id.as_str().to_owned());
     match services.settings.save(&settings) {
         Ok(()) => Response::result(request.id.clone(), json!(account)),
+        Err(error) => response_error(request, catalog, "rpc.account.default", &error),
+    }
+}
+
+fn account_default_query(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+    let settings = match services.settings.load() {
+        Ok(settings) => settings,
+        Err(error) => return response_error(request, catalog, "rpc.account.default", &error),
+    };
+    let Some(default) = settings.default_account else {
+        return Response::result(request.id.clone(), Value::Null);
+    };
+    let Ok(id) = AccountId::new(default) else {
+        return Response::result(request.id.clone(), Value::Null);
+    };
+    match services.accounts.get(&id) {
+        Ok(Some(account)) => Response::result(request.id.clone(), json!(account)),
+        Ok(None) => Response::result(request.id.clone(), Value::Null),
         Err(error) => response_error(request, catalog, "rpc.account.default", &error),
     }
 }
@@ -3182,7 +3307,82 @@ fn default_instance(services: &Services, catalog: &Catalog) -> Result<Id, (i32, 
     Id::new(raw).map_err(|error| (INVALID_PARAMS, error.to_string()))
 }
 
-fn instance_get(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+fn instance_java(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+    let id = match instance_id(request) {
+        Some(id) => id,
+        None => match default_instance(services, catalog) {
+            Ok(id) => id,
+            Err((code, message)) => {
+                return Response::fault(request.id.clone(), code, message);
+            }
+        },
+    };
+    let instance = match services.repository.load(&id) {
+        Ok(instance) => instance,
+        Err(error) => return response_error(request, catalog, "rpc.instance.info", &error),
+    };
+    let (source, java, major) = if let Some(path) = &instance.config.java_path {
+        let java = java_executable(path);
+        let major = arkmcl_storage::java::inspect(&java)
+            .ok()
+            .map(|runtime| runtime.major);
+        ("path", java, major)
+    } else {
+        let suggested = if let Some(version) = instance.config.java_version {
+            version
+        } else {
+            let Some(base) = instance.profile.minecraft() else {
+                return Response::fault(
+                    request.id.clone(),
+                    INTERNAL_ERROR,
+                    catalog.text("rpc.launch.minecraft").to_owned(),
+                );
+            };
+            let version = match services.fetcher.version(&base.version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return Response::fault(
+                        request.id.clone(),
+                        INTERNAL_ERROR,
+                        catalog.format("rpc.launch.prepare", &[("error", &error.to_string())]),
+                    );
+                }
+            };
+            version.java_version.as_ref().map_or(
+                if instance.kind == InstanceKind::Server {
+                    21
+                } else {
+                    8
+                },
+                |java| java.major_version,
+            )
+        };
+        let Some(runtime) = arkmcl_storage::java::select(suggested) else {
+            return Response::fault(
+                request.id.clone(),
+                INTERNAL_ERROR,
+                catalog.format("rpc.launch.java", &[("major", &suggested.to_string())]),
+            );
+        };
+        let source = if instance.config.java_version.is_some() {
+            "version"
+        } else {
+            "default"
+        };
+        (source, runtime.path, Some(runtime.major))
+    };
+    Response::result(
+        request.id.clone(),
+        json!({
+            "id": instance.id,
+            "source": source,
+            "java": java.display().to_string(),
+            "version": major,
+        }),
+    )
+}
+
+fn instance_info(request: &Request, services: &Services, catalog: &Catalog) -> Response {
     let id = match instance_id(request) {
         Some(id) => id,
         None => match default_instance(services, catalog) {
@@ -3194,7 +3394,7 @@ fn instance_get(request: &Request, services: &Services, catalog: &Catalog) -> Re
     };
     match services.repository.load(&id) {
         Ok(instance) => Response::result(request.id.clone(), json!(instance)),
-        Err(error) => response_error(request, catalog, "rpc.instance.get", &error),
+        Err(error) => response_error(request, catalog, "rpc.instance.info", &error),
     }
 }
 
@@ -3205,7 +3405,7 @@ fn instance_update(request: &Request, services: &Services, catalog: &Catalog) ->
     };
     let mut instance = match services.repository.load(&id) {
         Ok(instance) => instance,
-        Err(error) => return response_error(request, catalog, "rpc.instance.get", &error),
+        Err(error) => return response_error(request, catalog, "rpc.instance.info", &error),
     };
     let previous_group = instance.group.clone();
     if let Some(value) = request.params.get("type") {
@@ -3295,6 +3495,26 @@ fn instance_update(request: &Request, services: &Services, catalog: &Catalog) ->
             return invalid_field(request, catalog, "java_path");
         }
     }
+    if let Some(value) = request.params.get("java") {
+        let Some(raw) = value.as_str() else {
+            return invalid_field(request, catalog, "java");
+        };
+        match parse_java(raw, catalog) {
+            Ok(JavaChoice::Default) => {
+                instance.config.java_path = None;
+                instance.config.java_version = None;
+            }
+            Ok(JavaChoice::Version(version)) => {
+                instance.config.java_path = None;
+                instance.config.java_version = Some(version);
+            }
+            Ok(JavaChoice::Path(path)) => {
+                instance.config.java_version = None;
+                instance.config.java_path = Some(path);
+            }
+            Err((code, message)) => return Response::fault(request.id.clone(), code, message),
+        }
+    }
     if let Some(value) = request.params.get("lwjgl") {
         if value.is_null() {
             instance.config.lwjgl = None;
@@ -3358,7 +3578,9 @@ fn instance_update(request: &Request, services: &Services, catalog: &Catalog) ->
         .filter(|version| !version.is_empty());
     let server_instance = instance.kind == InstanceKind::Server;
     if let Some(loader) = loader {
-        if !loader_allowed(probe.kind, &loader.to_ascii_lowercase()) {
+        if !loader.eq_ignore_ascii_case("none")
+            && !loader_allowed(probe.kind, &loader.to_ascii_lowercase())
+        {
             return Response::fault(
                 request.id.clone(),
                 INVALID_PARAMS,
@@ -3419,7 +3641,7 @@ fn instance_update(request: &Request, services: &Services, catalog: &Catalog) ->
                 }
                 profile_changed = true;
             }
-            "none" | "vanilla" => {
+            "none" => {
                 probe.profile.remove(FABRIC);
                 probe.profile.remove(FORGE);
                 probe.profile.remove(NEOFORGE);
@@ -3539,6 +3761,7 @@ fn settings_get(request: &Request, services: &Services, catalog: &Catalog) -> Re
     }
 }
 
+#[allow(clippy::too_many_lines)] // 逐字段校验全局默认项；拆分反而降低可读性
 fn settings_update(request: &Request, services: &Services, catalog: &Catalog) -> Response {
     let mut settings = match services.settings.load() {
         Ok(settings) => settings,
@@ -3601,6 +3824,58 @@ fn settings_update(request: &Request, services: &Services, catalog: &Catalog) ->
         }
         settings.instance.linking = text;
     }
+    if let Some(value) = request.params.get("java") {
+        let Some(text) = value.as_str() else {
+            return invalid_field(request, catalog, "java");
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return invalid_field(request, catalog, "java");
+        }
+        if text.eq_ignore_ascii_case("default") {
+            "default".clone_into(&mut settings.instance.java);
+        } else if let Ok(version) = text.parse::<u32>() {
+            if version == 0 {
+                return invalid_field(request, catalog, "java");
+            }
+            settings.instance.java = version.to_string();
+        } else {
+            text.clone_into(&mut settings.instance.java);
+        }
+    }
+    if let Some(value) = request.params.get("type") {
+        let Some(kind) = parse_kind(value) else {
+            return invalid_field(request, catalog, "type");
+        };
+        settings.instance.kind = kind;
+    }
+    if let Some(value) = request.params.get("loader") {
+        if value.is_null() {
+            settings.instance.loader = None;
+        } else if let Some(text) = value.as_str() {
+            let text = text.trim().to_ascii_lowercase();
+            if text.is_empty() || text == "none" {
+                settings.instance.loader = None;
+            } else if matches!(text.as_str(), "fabric" | "forge" | "neoforge" | "purpur") {
+                settings.instance.loader = Some(text);
+            } else {
+                return invalid_field(request, catalog, "loader");
+            }
+        } else {
+            return invalid_field(request, catalog, "loader");
+        }
+    }
+    if let Some(value) = request.params.get("create_defaults") {
+        let Some(value) = value.as_bool() else {
+            return invalid_field(request, catalog, "create_defaults");
+        };
+        settings.instance.create_defaults = value;
+    }
+    if let Some(loader) = &settings.instance.loader {
+        if !loader_allowed(settings.instance.kind, loader) {
+            return invalid_field(request, catalog, "loader");
+        }
+    }
     match services.settings.save(&settings) {
         Ok(()) => Response::result(request.id.clone(), json!(settings.instance)),
         Err(error) => response_error(request, catalog, "rpc.settings.update", &error),
@@ -3613,7 +3888,7 @@ fn instance_link(request: &Request, services: &Services, catalog: &Catalog) -> R
     };
     let instance = match services.repository.load(&id) {
         Ok(instance) => instance,
-        Err(error) => return response_error(request, catalog, "rpc.instance.get", &error),
+        Err(error) => return response_error(request, catalog, "rpc.instance.info", &error),
     };
     let remove = request
         .params
@@ -3670,7 +3945,7 @@ fn instance_links(request: &Request, services: &Services, catalog: &Catalog) -> 
     };
     let instance = match services.repository.load(&id) {
         Ok(instance) => instance,
-        Err(error) => return response_error(request, catalog, "rpc.instance.get", &error),
+        Err(error) => return response_error(request, catalog, "rpc.instance.info", &error),
     };
     let names = arkmcl_storage::links::link_names(instance.kind);
     match services.linker.inspect(&instance.root, names) {
@@ -3814,15 +4089,9 @@ fn allocate_id(services: &Services, base: &str) -> Option<Id> {
 }
 
 fn loader_allowed(kind: InstanceKind, loader: &str) -> bool {
-    if matches!(loader, "none" | "vanilla") {
-        return true;
-    }
     match kind {
-        InstanceKind::Client => matches!(loader, "fabric" | "quilt" | "forge" | "neoforge"),
-        InstanceKind::Server => matches!(
-            loader,
-            "purpur" | "fabric" | "forge" | "neoforge" | "none" | "vanilla"
-        ),
+        InstanceKind::Client => matches!(loader, "fabric" | "forge" | "neoforge"),
+        InstanceKind::Server => matches!(loader, "purpur" | "fabric" | "forge" | "neoforge"),
     }
 }
 
@@ -3878,6 +4147,7 @@ fn server_plan(
     services: &Services,
     catalog: &Catalog,
     sink: &(dyn Fn(Value) + Sync),
+    threads: usize,
 ) -> Result<(Plan, DownloadReport), (i32, String)> {
     let Some(base) = instance
         .profile
@@ -3897,21 +4167,23 @@ fn server_plan(
     })?;
     let jar = instance.root.join("server.jar");
     let mut downloads = DownloadReport::default();
-    let required = version
+    let suggested = version
         .java_version
         .as_ref()
         .map_or(21, |java| java.major_version);
-    let java = instance
-        .config
-        .java_path
-        .clone()
-        .or_else(|| arkmcl_storage::java::select(required).map(|runtime| runtime.path))
-        .ok_or_else(|| {
-            (
-                INTERNAL_ERROR,
-                catalog.format("rpc.launch.java", &[("major", &required.to_string())]),
-            )
-        })?;
+    let required = instance.config.java_version.unwrap_or(suggested);
+    let java = if let Some(path) = &instance.config.java_path {
+        java_executable(path)
+    } else {
+        arkmcl_storage::java::select(required)
+            .map(|runtime| runtime.path)
+            .ok_or_else(|| {
+                (
+                    INTERNAL_ERROR,
+                    catalog.format("rpc.launch.java", &[("major", &required.to_string())]),
+                )
+            })?
+    };
 
     let forge_kind = existing_forge_kind(&instance.profile);
     let forge_loader = instance
@@ -3956,6 +4228,7 @@ fn server_plan(
                 &jar,
                 &services.downloader,
                 &progress,
+                threads,
             )
             .map_err(|error| {
                 (
@@ -3980,7 +4253,7 @@ fn server_plan(
             };
             downloads = services
                 .downloader
-                .run_with(&[task], DownloadMode::SkipExisting, &progress)
+                .run_with_threads(&[task], DownloadMode::SkipExisting, &progress, threads)
                 .map_err(|error| {
                     (
                         INTERNAL_ERROR,
@@ -4008,7 +4281,7 @@ fn server_plan(
             };
             downloads = services
                 .downloader
-                .run_with(&[task], DownloadMode::SkipExisting, &progress)
+                .run_with_threads(&[task], DownloadMode::SkipExisting, &progress, threads)
                 .map_err(|error| {
                     (
                         INTERNAL_ERROR,
@@ -4186,20 +4459,51 @@ fn instance_list(request: &Request, services: &Services, catalog: &Catalog) -> R
     }
 }
 
+#[derive(Debug, Clone)]
+enum JavaChoice {
+    Default,
+    Version(u32),
+    Path(PathBuf),
+}
+
 struct CreateRequest {
     id: Option<Id>,
-    kind: InstanceKind,
+    kind: Option<InstanceKind>,
     name: Option<String>,
-    defaults: bool,
+    defaults: Option<bool>,
     memory_mb: Option<u32>,
     jvm_args: Option<Vec<String>>,
     linking: Option<String>,
     lwjgl: Option<String>,
+    java: Option<JavaChoice>,
     group: Option<String>,
     minecraft: Option<String>,
     loader: Option<String>,
     loader_version: Option<String>,
     account: Option<String>,
+}
+
+fn parse_java(raw: &str, catalog: &Catalog) -> Result<JavaChoice, (i32, String)> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("default") {
+        return Ok(JavaChoice::Default);
+    }
+    if let Ok(version) = raw.parse::<u32>() {
+        if version == 0 {
+            return Err((
+                INVALID_PARAMS,
+                catalog.format("rpc.instance.java", &[("value", raw)]),
+            ));
+        }
+        return Ok(JavaChoice::Version(version));
+    }
+    if raw.is_empty() {
+        return Err((
+            INVALID_PARAMS,
+            catalog.format("rpc.instance.java", &[("value", raw)]),
+        ));
+    }
+    Ok(JavaChoice::Path(PathBuf::from(raw)))
 }
 
 #[allow(clippy::too_many_lines)] // flag validation; split when more fields are added
@@ -4211,11 +4515,7 @@ fn parse_create(request: &Request, catalog: &Catalog) -> Result<CreateRequest, (
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
-    let defaults = request
-        .params
-        .get("defaults")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let defaults = request.params.get("defaults").and_then(Value::as_bool);
     let memory_mb = request
         .params
         .get("memory_mb")
@@ -4249,17 +4549,19 @@ fn parse_create(request: &Request, catalog: &Catalog) -> Result<CreateRequest, (
         .transpose()
         .map_err(|error| (INVALID_PARAMS, error.to_string()))?;
     let kind = match request.params.get("type") {
-        None => InstanceKind::Client,
-        Some(value) => parse_kind(value)
-            .ok_or_else(|| (INVALID_PARAMS, catalog.text("rpc.instance.type").to_owned()))?,
+        None => None,
+        Some(value) => Some(
+            parse_kind(value)
+                .ok_or_else(|| (INVALID_PARAMS, catalog.text("rpc.instance.type").to_owned()))?,
+        ),
     };
     let loader = request
         .params
         .get("loader")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|loader| !loader.is_empty())
-        .map(str::to_ascii_lowercase);
+        .map(str::to_ascii_lowercase)
+        .filter(|loader| !loader.is_empty());
     let loader_version = request
         .params
         .get("loader_version")
@@ -4276,20 +4578,11 @@ fn parse_create(request: &Request, catalog: &Catalog) -> Result<CreateRequest, (
     if let Some(loader) = &loader {
         if !matches!(
             loader.as_str(),
-            "fabric" | "quilt" | "forge" | "neoforge" | "purpur"
+            "fabric" | "forge" | "neoforge" | "purpur" | "none"
         ) {
             return Err((
                 INVALID_PARAMS,
                 catalog.format("rpc.instance.loader", &[("loader", loader)]),
-            ));
-        }
-        if !loader_allowed(kind, loader) {
-            return Err((
-                INVALID_PARAMS,
-                catalog.format(
-                    "rpc.instance.loader_kind",
-                    &[("loader", loader), ("kind", kind_label(kind))],
-                ),
             ));
         }
     }
@@ -4316,6 +4609,13 @@ fn parse_create(request: &Request, catalog: &Catalog) -> Result<CreateRequest, (
         .map(str::trim)
         .filter(|account| !account.is_empty())
         .map(str::to_owned);
+    let java = match request.params.get("java") {
+        None => None,
+        Some(value) => {
+            let raw = value.as_str().unwrap_or("");
+            Some(parse_java(raw, catalog)?)
+        }
+    };
     let lwjgl = match request.params.get("lwjgl") {
         None => None,
         Some(value) => match value.as_str().map(str::trim) {
@@ -4339,6 +4639,7 @@ fn parse_create(request: &Request, catalog: &Catalog) -> Result<CreateRequest, (
         jvm_args,
         linking,
         lwjgl,
+        java,
         group,
         minecraft,
         loader,
@@ -4644,6 +4945,32 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
         Err((code, message)) => return Response::fault(request.id.clone(), code, message),
     };
     let defaults = instance_defaults(services);
+    let kind = parsed.kind.unwrap_or(defaults.kind);
+    let loader = match parsed.loader.as_deref() {
+        Some("none") => None,
+        Some(loader) => Some(loader.to_owned()),
+        None => defaults.loader.clone(),
+    };
+    if parsed.loader_version.is_some() && loader.is_none() {
+        return Response::fault(
+            request.id.clone(),
+            INVALID_PARAMS,
+            catalog.text("rpc.instance.loader_version").to_owned(),
+        );
+    }
+    if let Some(loader) = &loader {
+        if !loader_allowed(kind, loader) {
+            return Response::fault(
+                request.id.clone(),
+                INVALID_PARAMS,
+                catalog.format(
+                    "rpc.instance.loader_kind",
+                    &[("loader", loader), ("kind", kind_label(kind))],
+                ),
+            );
+        }
+    }
+    let create_defaults = parsed.defaults.unwrap_or(defaults.create_defaults);
     let version = match parsed
         .minecraft
         .clone()
@@ -4661,9 +4988,13 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
             }
         },
     };
-    let loader_label = parsed.loader.as_deref().unwrap_or("vanilla");
+    let loader_label = loader.as_deref().unwrap_or("vanilla");
     let default_name = format!("{loader_label}-{version}");
-    let name = parsed.name.clone().unwrap_or_else(|| default_name.clone());
+    let name = parsed
+        .name
+        .clone()
+        .or_else(|| parsed.id.as_ref().map(|id| id.as_str().to_owned()))
+        .unwrap_or_else(|| default_name.clone());
     let id = if let Some(id) = parsed.id.clone() {
         id
     } else {
@@ -4683,7 +5014,7 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
         }
     };
     let mut spec = NewInstance::with_id(id);
-    spec.kind = parsed.kind;
+    spec.kind = kind;
     spec.name = name;
     spec.group = parsed
         .group
@@ -4691,6 +5022,15 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
         .or(defaults.group.clone())
         .or_else(|| Some(loader_label.to_owned()));
     spec.config.lwjgl = parsed.lwjgl;
+    let java = parsed
+        .java
+        .clone()
+        .or_else(|| parse_java(&defaults.java, catalog).ok());
+    match java {
+        Some(JavaChoice::Version(version)) => spec.config.java_version = Some(version),
+        Some(JavaChoice::Path(path)) => spec.config.java_path = Some(path),
+        Some(JavaChoice::Default) | None => {}
+    }
     spec.config.memory_mb = parsed.memory_mb.unwrap_or(defaults.memory_mb);
     spec.config.jvm_args = parsed
         .jvm_args
@@ -4712,7 +5052,7 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
             if let Some(group) = &instance.group {
                 let _ = services.groups.add(group);
             }
-            if parsed.defaults {
+            if create_defaults {
                 match instance.kind {
                     InstanceKind::Client => copy_instance_defaults(&services.data, &instance.root),
                     InstanceKind::Server => copy_server_defaults(&services.data, &instance.root),
@@ -4731,7 +5071,7 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
                 }
             };
             ensure_eula(&instance);
-            let applied = match parsed.loader.as_deref() {
+            let applied = match loader.as_deref() {
                 Some("fabric") => apply_fabric(
                     &mut instance,
                     services,
@@ -4744,7 +5084,7 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
                     catalog,
                     parsed.loader_version.as_deref(),
                     ForgeKind::Forge,
-                    parsed.kind == InstanceKind::Server,
+                    kind == InstanceKind::Server,
                 ),
                 Some("neoforge") => apply_forge(
                     &mut instance,
@@ -4752,7 +5092,7 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
                     catalog,
                     parsed.loader_version.as_deref(),
                     ForgeKind::NeoForge,
-                    parsed.kind == InstanceKind::Server,
+                    kind == InstanceKind::Server,
                 ),
                 Some("purpur") => apply_purpur(
                     &mut instance,
@@ -4760,14 +5100,14 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
                     catalog,
                     parsed.loader_version.as_deref(),
                 ),
-                Some("none" | "vanilla") | None => Ok(()),
+                None => Ok(()),
                 Some(other) => Err(catalog.format("rpc.instance.loader", &[("loader", other)])),
             };
             if let Err(message) = applied {
                 let _ = services.repository.delete(&instance.id);
                 return Response::fault(request.id.clone(), INTERNAL_ERROR, message);
             }
-            if parsed.loader.is_some() {
+            if loader.is_some() {
                 if let Err(error) = services.repository.save(&instance) {
                     let _ = services.repository.delete(&instance.id);
                     return response_error(request, catalog, "rpc.instance.create", &error);
@@ -4789,13 +5129,13 @@ fn instance_create(request: &Request, services: &Services, catalog: &Catalog) ->
     }
 }
 
-fn instance_delete(request: &Request, services: &Services, catalog: &Catalog) -> Response {
+fn instance_remove(request: &Request, services: &Services, catalog: &Catalog) -> Response {
     let Some(id) = instance_id(request) else {
         return invalid_id(request, catalog);
     };
     let instance = match services.repository.load(&id) {
         Ok(instance) => instance,
-        Err(error) => return response_error(request, catalog, "rpc.instance.delete", &error),
+        Err(error) => return response_error(request, catalog, "rpc.instance.remove", &error),
     };
     match arkmcl_storage::lock::Guard::check(&LocalFileSystem, &instance.root) {
         Ok(()) => {}
@@ -4806,7 +5146,7 @@ fn instance_delete(request: &Request, services: &Services, catalog: &Catalog) ->
                 catalog.text("rpc.launch.locked").to_owned(),
             );
         }
-        Err(error) => return response_error(request, catalog, "rpc.instance.delete", &error),
+        Err(error) => return response_error(request, catalog, "rpc.instance.remove", &error),
     }
     match arkmcl_storage::trash::trash(&instance.root) {
         Ok(trashed) => {
@@ -4822,7 +5162,7 @@ fn instance_delete(request: &Request, services: &Services, catalog: &Catalog) ->
         Err(error) => Response::fault(
             request.id.clone(),
             INTERNAL_ERROR,
-            catalog.format("rpc.instance.delete", &[("error", &error.to_string())]),
+            catalog.format("rpc.instance.remove", &[("error", &error.to_string())]),
         ),
     }
 }

@@ -96,6 +96,213 @@ fn create_requires_name_without_id() {
 }
 
 #[test]
+fn read_only_actions_reject_setters() {
+    let cases: [(&[&str], &str); 5] = [
+        (
+            &["--lang", "en-US", "instance", "--list", "--name", "foo"],
+            "--name",
+        ),
+        (
+            &[
+                "--lang", "en-US", "instance", "demo", "--info", "--memory", "1024",
+            ],
+            "--memory",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "launch",
+                "one",
+                "--stop",
+                "--account",
+                "x",
+            ],
+            "--account",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "account",
+                "player",
+                "--add",
+                "--list-sort-by",
+                "name",
+            ],
+            "--list-sort-by",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "launch",
+                "one",
+                "--prepare",
+                "--list-sort",
+                "desc",
+            ],
+            "--list-sort",
+        ),
+    ];
+    for (args, needle) in cases {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(needle),
+            "args: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn instance_type_and_create_defaults_stay_global() {
+    for args in [
+        &["--lang", "en-US", "instance", "demo", "--type", "server"][..],
+        &[
+            "--lang",
+            "en-US",
+            "instance",
+            "demo",
+            "--create-defaults",
+            "false",
+        ][..],
+        &["--lang", "en-US", "instance", "demo", "--create-defaults"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).is_empty(),
+            "args: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn resource_actions_reject_irrelevant_flags() {
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["--lang", "en-US", "resource", "--list", "--api", "modrinth"],
+            "--api",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "resource",
+                "--autoremove",
+                "--list-limit",
+                "5",
+            ],
+            "--list-limit",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "resource",
+                "--search",
+                "sodium",
+                "--type",
+                "mods",
+                "--download-to-instance",
+                "x",
+            ],
+            "--download-to-instance",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "resource",
+                "--lookup",
+                "sodium",
+                "--list-sort",
+                "desc",
+            ],
+            "--list-sort",
+        ),
+    ];
+    for (args, needle) in cases {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(needle),
+            "args: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn launch_account_was_removed() {
+    let output = run(&["--lang", "en-US", "launch", "--account", "x"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--account"));
+}
+
+#[test]
+fn account_add_rejects_list() {
+    let output = run(&["--lang", "en-US", "account", "player", "--add", "--list"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--list"));
+}
+
+#[test]
+fn action_flags_must_not_conflict() {
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["--lang", "en-US", "launch", "one", "--start", "--stop"],
+            "--start",
+        ),
+        (
+            &["--lang", "en-US", "account", "player", "--info", "--add"],
+            "--info",
+        ),
+        (
+            &["--lang", "en-US", "instance", "--list", "--remove", "foo"],
+            "--list",
+        ),
+        (
+            &[
+                "--lang",
+                "en-US",
+                "resource",
+                "--list-remote",
+                "--autoremove",
+            ],
+            "--list-remote",
+        ),
+    ];
+    for (args, needle) in cases {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(needle),
+            "args: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn prepare_rejects_invalid_threads() {
+    for value in ["0", "65", "many"] {
+        let output = run(&[
+            "--lang",
+            "en-US",
+            "launch",
+            "--prepare",
+            "--prepare-download-threads",
+            value,
+        ]);
+        assert_eq!(output.status.code(), Some(2), "value: {value}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(value),
+            "value: {value}"
+        );
+    }
+}
+
+#[test]
 fn launch_start_rejects_batch() {
     let batch = run(&["--lang", "en-US", "launch", "--start", "one", "two"]);
     assert_eq!(batch.status.code(), Some(2));
@@ -106,7 +313,7 @@ fn launch_start_rejects_batch() {
 fn remove_requires_selector() {
     let output = run(&["--lang", "en-US", "account", "--remove"]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("<uuid|name>"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<id|name>"));
 }
 
 #[test]
@@ -128,10 +335,10 @@ fn resource_validates_arguments_before_connecting() {
 }
 
 #[test]
-fn account_default_requires_selector() {
-    let output = run(&["--lang", "en-US", "account", "--default"]);
+fn account_default_rejects_batch() {
+    let output = run(&["--lang", "en-US", "account", "--default", "one", "two"]);
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("<uuid|name>"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--default"));
 }
 
 #[test]
@@ -209,12 +416,14 @@ fn completion_scripts_track_current_flags() {
         for name in [
             "type",
             "group-move",
-            "linking",
+            "link",
             "lwjgl",
             "create-defaults",
             "move",
             "import",
             "download-plugin",
+            "prepare-download-threads",
+            "java",
         ] {
             let needle = if shell == "fish" {
                 format!("-l {name}")

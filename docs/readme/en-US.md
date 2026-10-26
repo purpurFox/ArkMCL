@@ -51,7 +51,9 @@ cargo run -p arkmcl-cli -- --lang en-US service stop
 # Instances
 cargo run -p arkmcl-cli -- --lang en-US instance my-instance --create --name "My Instance" --version 1.20.4
 cargo run -p arkmcl-cli -- --lang en-US instance fabric-demo --create --name "Fabric Demo" --version 1.20.4 --loader fabric --loader-version 0.15.11
+cargo run -p arkmcl-cli -- --lang en-US instance           # print global defaults
 cargo run -p arkmcl-cli -- --lang en-US instance --list
+cargo run -p arkmcl-cli -- --lang en-US instance my-instance          # print instance info (same as --info)
 cargo run -p arkmcl-cli -- --lang en-US instance my-instance --info
 cargo run -p arkmcl-cli -- --lang en-US instance my-instance --default
 cargo run -p arkmcl-cli -- --lang en-US instance my-instance --memory 4096 --jvm-args "-Xmx4G -Dfoo=bar"
@@ -61,6 +63,7 @@ cargo run -p arkmcl-cli -- --lang en-US instance my-instance --loader none
 cargo run -p arkmcl-cli -- --lang en-US instance --group
 cargo run -p arkmcl-cli -- --lang en-US launch my-instance --prepare
 cargo run -p arkmcl-cli -- --lang en-US launch my-instance --start
+cargo run -p arkmcl-cli -- --lang en-US launch my-instance          # attach the console (same as --terminal)
 cargo run -p arkmcl-cli -- --lang en-US launch my-instance --terminal
 cargo run -p arkmcl-cli -- --lang en-US launch --list
 cargo run -p arkmcl-cli -- --lang en-US launch my-instance --stop
@@ -71,6 +74,7 @@ cargo run -p arkmcl-cli -- --lang en-US account --refresh
 cargo run -p arkmcl-cli -- --lang en-US account Player --add
 cargo run -p arkmcl-cli -- --lang en-US account Ext --add --server https://example.com/auth
 cargo run -p arkmcl-cli -- --lang en-US account --add   # Microsoft device-code login
+cargo run -p arkmcl-cli -- --lang en-US account Player --info
 cargo run -p arkmcl-cli -- --lang en-US account Player --default
 cargo run -p arkmcl-cli -- --lang en-US account Player --remove
 
@@ -86,7 +90,8 @@ cargo run -p arkmcl-cli -- --lang en-US resource --list-remote --filter-loader n
 - The socket defaults to `$XDG_RUNTIME_DIR/com.purft.arkmcl/arkmcl.sock`.
 - If `XDG_RUNTIME_DIR` is missing, it falls back to
   `$XDG_STATE_HOME/com.purft.arkmcl/run/arkmcl.sock`.
-- Current RPC methods: `server.info`, `server.shutdown`, `instance.*`, `launch.*`, `account.add/list/default/remove`.
+- Current RPC methods: `server.info`, `server.stop`, `instance.*`, `launch.*`, `account.add/info/list/default/remove`.
+- Protocol handshake: `server.info` returns `protocol` and `capabilities`; the CLI checks the major version on first connection and refuses incompatible services.
 
 ### Shell completion
 
@@ -147,7 +152,7 @@ Implemented:
 
 - Rust workspace: `arkmcl-core`, `arkmcl-l10n`, `arkmcl-platform`, `arkmcl-storage`, `arkmcl-cli`, `arkmcl-service`
 - CLI: `account`, `instance`, `launch`, `resource` with grouped lists, wildcards, batch confirmation, and `--json`, bilingual; auto-starts `arkmcl-service` when it is not running (`ARKMCL_NO_AUTOSTART=1` disables this; `service status`/`stop` never start it); help entries are sorted alphabetically
-- Service: Unix socket + JSON-RPC with info, shutdown, instance CRUD, config updates, and lock checks
+- Service: Unix socket + JSON-RPC with info, stop, instance CRUD, config updates, and lock checks
 - Path resolution: XDG defaults, explicit environment variables, portable mode (disabled by default)
 - Instance repository: JSON storage, ID allocation, config validation, atomic writes
 - Time statistics: instance created/last launched/run seconds and account created/last used/run seconds, used by list sorting
@@ -168,7 +173,7 @@ Implemented:
 - Resource dependencies: Modrinth `required` dependencies are resolved recursively; `incompatible` conflicts are reported; results include `resolved`
 - `--autoremove`: lists global mods/resourcepacks/shaderpacks/datapacks not referenced by any instance; `--yes` moves them to trash
 - System keyring: prefers `secret-tool` and falls back to `tokens.json`
-- Global defaults: stored in the `instance` field of `settings.json`; without a selector, `--memory|--version|--jvm-args|--group` read or write them; with a selector and no value they print the instance's current setting"
+- Global defaults: stored in the `instance` field of `settings.json`; without a selector, `--memory|--version|--jvm-args|--group|--type|--loader|--create-defaults` read or write them; with a selector and no value they print the instance's current setting, while `--type` and `--create-defaults` apply to the global default only
 - Natives extraction: honors `extract.exclude`, uses ZIP `enclosed_name` to block path traversal
 - Launch preparation: `launch <id> --prepare` fetches metadata, merges loaders, downloads dependencies, extracts natives, and returns a launch plan
 - Launch execution: `launch <id> --start`, `launch <id> --terminal`, `launch --list`, `launch <id> --stop`; the console forwards stdout/stderr and accepts stdin, exit codes and crash reports are stored on the instance, and logs go to `logs/latest.log`

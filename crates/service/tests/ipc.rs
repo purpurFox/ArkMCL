@@ -57,8 +57,8 @@ impl Service {
     }
 
     fn finish(self) {
-        let response = self.call(99, "server.shutdown", json!({}));
-        assert_eq!(response.result.expect("shutdown")["stopping"], true);
+        let response = self.call(99, "server.stop", json!({}));
+        assert_eq!(response.result.expect("stop")["stopping"], true);
         self.handle
             .join()
             .expect("server thread")
@@ -78,6 +78,19 @@ fn serves_info_and_instance_crud() {
         .expect("info");
     assert_eq!(info["name"], "ArkMCL");
     assert_eq!(info["locale"], "en-US");
+    assert_eq!(
+        info["protocol"].as_u64(),
+        Some(u64::from(ipc::PROTOCOL_VERSION))
+    );
+    let capabilities = info["capabilities"].as_array().expect("capabilities");
+    assert!(capabilities.iter().any(|value| value == "instance"));
+    assert!(capabilities.iter().any(|value| value == "launch"));
+
+    let status = service
+        .call(20, "server.status", json!({}))
+        .result
+        .expect("status");
+    assert_eq!(status["name"], "ArkMCL");
 
     let created = service
         .call(
@@ -102,7 +115,7 @@ fn serves_info_and_instance_crud() {
     );
 
     let got = service
-        .call(4, "instance.get", json!({"id": "test"}))
+        .call(4, "instance.info", json!({"id": "test"}))
         .result
         .expect("get");
     assert_eq!(got["name"], "Test");
@@ -128,7 +141,7 @@ fn serves_info_and_instance_crud() {
     assert_eq!(entries[0]["name"], "Renamed");
 
     let deleted = service
-        .call(11, "instance.delete", json!({"id": "test"}))
+        .call(11, "instance.remove", json!({"id": "test"}))
         .result
         .expect("delete");
     assert_eq!(deleted["deleted"], true);
@@ -164,19 +177,63 @@ fn lock_blocks_updates_and_deletes() {
     );
     assert!(response.error.is_some(), "update must be blocked by lock");
 
-    let response = service.call(3, "instance.delete", json!({"id": "test"}));
+    let response = service.call(3, "instance.remove", json!({"id": "test"}));
     assert!(response.error.is_some(), "delete must be blocked by lock");
     assert!(root.exists());
 
     fs::remove_file(&lock_path).expect("unlock");
     let deleted = service
-        .call(4, "instance.delete", json!({"id": "test"}))
+        .call(4, "instance.remove", json!({"id": "test"}))
         .result
         .expect("delete");
     assert_eq!(deleted["deleted"], true);
     assert!(!root.exists());
     assert!(service.directory.join("saves").is_dir());
 
+    service.finish();
+}
+
+#[test]
+fn explicit_id_sets_default_name() {
+    let service = Service::start("create-id-name");
+    let created = service
+        .call(
+            1,
+            "instance.create",
+            json!({"id": "my-id", "minecraft": "1.20.4"}),
+        )
+        .result
+        .expect("create");
+    assert_eq!(created["instance"]["id"], "my-id");
+    assert_eq!(created["instance"]["name"], "my-id");
+    service.finish();
+}
+
+#[test]
+fn missing_id_keeps_template_name() {
+    let service = Service::start("create-template-name");
+    let created = service
+        .call(1, "instance.create", json!({"minecraft": "1.20.4"}))
+        .result
+        .expect("create");
+    assert_eq!(created["instance"]["id"], "vanilla-1-20-4");
+    assert_eq!(created["instance"]["name"], "vanilla-1.20.4");
+    service.finish();
+}
+
+#[test]
+fn allows_dots_in_instance_id() {
+    let service = Service::start("create-dotted-id");
+    let created = service
+        .call(
+            1,
+            "instance.create",
+            json!({"id": "test-1.17.1", "minecraft": "1.20.4"}),
+        )
+        .result
+        .expect("create");
+    assert_eq!(created["instance"]["id"], "test-1.17.1");
+    assert_eq!(created["instance"]["name"], "test-1.17.1");
     service.finish();
 }
 
@@ -285,7 +342,9 @@ fn starts_and_stops_process() {
         .expect("create");
     write_launch_cache(&service.directory);
 
-    let script = service.directory.join("fake-java");
+    let jdk = service.directory.join("fake-jdk");
+    let script = jdk.join("bin").join("java");
+    fs::create_dir_all(script.parent().expect("bin")).expect("bin");
     fs::write(&script, "#!/bin/sh\necho ready\nsleep 5\n").expect("script");
     let mut permissions = fs::metadata(&script).expect("metadata").permissions();
     permissions.set_mode(0o755);
@@ -294,7 +353,7 @@ fn starts_and_stops_process() {
         .call(
             2,
             "instance.update",
-            json!({"id": "proc", "java_path": script.to_string_lossy()}),
+            json!({"id": "proc", "java_path": jdk.to_string_lossy()}),
         )
         .result
         .expect("update java path");
@@ -303,6 +362,12 @@ fn starts_and_stops_process() {
     assert!(started.error.is_none(), "start error: {:?}", started.error);
     let pid = started.result.expect("start")["pid"].as_u64().expect("pid");
     assert!(pid > 0);
+
+    let terminal = service
+        .call(11, "launch.terminal", json!({"id": "proc"}))
+        .result
+        .expect("terminal");
+    assert_eq!(terminal["id"], "proc");
 
     let mut output = String::new();
     for _ in 0..20 {
@@ -319,12 +384,12 @@ fn starts_and_stops_process() {
     assert!(output.contains("ready"), "output: {output}");
 
     let status = service
-        .call(4, "launch.status", json!({}))
+        .call(4, "launch.list", json!({}))
         .result
         .expect("status");
     assert_eq!(status.as_array().expect("array").len(), 1);
 
-    let blocked = service.call(5, "instance.delete", json!({"id": "proc"}));
+    let blocked = service.call(5, "instance.remove", json!({"id": "proc"}));
     assert!(
         blocked.error.is_some(),
         "delete must be blocked while running"
@@ -335,7 +400,7 @@ fn starts_and_stops_process() {
 
     for _ in 0..20 {
         let status = service
-            .call(7, "launch.status", json!({}))
+            .call(7, "launch.list", json!({}))
             .result
             .expect("status");
         if status.as_array().expect("array").is_empty() {
@@ -344,7 +409,7 @@ fn starts_and_stops_process() {
         thread::sleep(Duration::from_millis(100));
     }
     let status = service
-        .call(8, "launch.status", json!({}))
+        .call(8, "launch.list", json!({}))
         .result
         .expect("status");
     assert_eq!(
@@ -353,8 +418,14 @@ fn starts_and_stops_process() {
         "expected no running sessions"
     );
 
+    let terminal = service.call(12, "launch.terminal", json!({"id": "proc"}));
+    assert!(
+        terminal.error.is_some(),
+        "terminal requires a running instance"
+    );
+
     let instance = service
-        .call(9, "instance.get", json!({"id": "proc"}))
+        .call(9, "instance.info", json!({"id": "proc"}))
         .result
         .expect("get");
     assert_eq!(instance["state"], "ready");
@@ -382,7 +453,9 @@ fn records_exit_code_and_crash() {
         .expect("create");
     write_launch_cache(&service.directory);
 
-    let script = service.directory.join("fake-java-crash");
+    let jdk = service.directory.join("fake-jdk-crash");
+    let script = jdk.join("bin").join("java");
+    fs::create_dir_all(script.parent().expect("bin")).expect("bin");
     fs::write(&script, "#!/bin/sh\nexit 3\n").expect("script");
     let mut permissions = fs::metadata(&script).expect("metadata").permissions();
     permissions.set_mode(0o755);
@@ -391,7 +464,7 @@ fn records_exit_code_and_crash() {
         .call(
             2,
             "instance.update",
-            json!({"id": "crash", "java_path": script.to_string_lossy()}),
+            json!({"id": "crash", "java_path": jdk.to_string_lossy()}),
         )
         .result
         .expect("update java path");
@@ -400,7 +473,7 @@ fn records_exit_code_and_crash() {
     assert!(started.error.is_none(), "start error: {:?}", started.error);
     for _ in 0..30 {
         let status = service
-            .call(4, "launch.status", json!({}))
+            .call(4, "launch.list", json!({}))
             .result
             .expect("status");
         if status.as_array().expect("array").is_empty() {
@@ -410,7 +483,7 @@ fn records_exit_code_and_crash() {
     }
 
     let instance = service
-        .call(5, "instance.get", json!({"id": "crash"}))
+        .call(5, "instance.info", json!({"id": "crash"}))
         .result
         .expect("get");
     assert_eq!(instance["last_exit_code"], 3);
@@ -532,7 +605,7 @@ fn updates_instance_defaults() {
         .expect("create");
     assert_eq!(created["instance"]["config"]["memory_mb"], 3072);
     assert_eq!(created["instance"]["group"], "custom");
-    assert_eq!(created["instance"]["name"], "vanilla-1.20.4");
+    assert_eq!(created["instance"]["name"], "custom");
     assert_eq!(
         created["instance"]["config"]["jvm_args"]
             .as_array()
@@ -566,7 +639,7 @@ fn creates_instance_with_default_values() {
         )
         .result
         .expect("create");
-    assert_eq!(created["instance"]["name"], "vanilla-1.20.4");
+    assert_eq!(created["instance"]["name"], "custom");
     assert_eq!(created["instance"]["group"], "vanilla");
     assert_eq!(created["instance"]["config"]["memory_mb"], 4096);
     assert_eq!(
@@ -575,6 +648,211 @@ fn creates_instance_with_default_values() {
             .expect("jvm args")
             .len(),
         20
+    );
+    service.finish();
+}
+
+#[test]
+fn updates_java_selection() {
+    let service = Service::start("instance-java");
+    let created = service
+        .call(
+            1,
+            "instance.create",
+            json!({"id": "java", "minecraft": "1.20.4", "java": "21"}),
+        )
+        .result
+        .expect("create");
+    assert_eq!(created["instance"]["config"]["java_version"], 21);
+    assert!(created["instance"]["config"]["java_path"].is_null());
+
+    let updated = service
+        .call(
+            2,
+            "instance.update",
+            json!({"id": "java", "java": "/opt/jdk-21"}),
+        )
+        .result
+        .expect("update");
+    assert_eq!(updated["config"]["java_path"], "/opt/jdk-21");
+    assert!(updated["config"]["java_version"].is_null());
+
+    let cleared = service
+        .call(
+            3,
+            "instance.update",
+            json!({"id": "java", "java": "default"}),
+        )
+        .result
+        .expect("update");
+    assert!(cleared["config"]["java_path"].is_null());
+    assert!(cleared["config"]["java_version"].is_null());
+
+    let invalid = service.call(4, "instance.update", json!({"id": "java", "java": "0"}));
+    assert_eq!(invalid.error.expect("invalid java").code, -32602);
+    service.finish();
+}
+
+#[test]
+fn queries_instance_java() {
+    let service = Service::start("instance-java-query");
+    service
+        .call(
+            1,
+            "instance.create",
+            json!({"id": "java", "minecraft": "1.20.4", "java": "/opt/jdk-21"}),
+        )
+        .result
+        .expect("create");
+    let value = service
+        .call(2, "instance.java", json!({"id": "java"}))
+        .result
+        .expect("java");
+    assert_eq!(value["source"], "path");
+    assert_eq!(value["java"], "/opt/jdk-21/bin/java");
+    assert!(value["version"].is_null());
+    service.finish();
+}
+
+#[test]
+fn global_java_default_applies_to_create() {
+    let service = Service::start("global-java");
+    let settings = service
+        .call(1, "settings.update", json!({"java": "21"}))
+        .result
+        .expect("settings");
+    assert_eq!(settings["java"], "21");
+
+    let created = service
+        .call(
+            2,
+            "instance.create",
+            json!({"id": "j", "minecraft": "1.20.4"}),
+        )
+        .result
+        .expect("create");
+    assert_eq!(created["instance"]["config"]["java_version"], 21);
+
+    let explicit = service
+        .call(
+            3,
+            "instance.create",
+            json!({"id": "j2", "minecraft": "1.20.4", "java": "default"}),
+        )
+        .result
+        .expect("create");
+    assert!(explicit["instance"]["config"]["java_version"].is_null());
+
+    service
+        .call(4, "settings.update", json!({"java": "default"}))
+        .result
+        .expect("reset");
+    let reset = service
+        .call(
+            5,
+            "instance.create",
+            json!({"id": "j3", "minecraft": "1.20.4"}),
+        )
+        .result
+        .expect("create");
+    assert!(reset["instance"]["config"]["java_version"].is_null());
+
+    service
+        .call(6, "settings.update", json!({"java": "/opt/jdk-21"}))
+        .result
+        .expect("path");
+    let path = service
+        .call(
+            7,
+            "instance.create",
+            json!({"id": "j4", "minecraft": "1.20.4"}),
+        )
+        .result
+        .expect("create");
+    assert_eq!(path["instance"]["config"]["java_path"], "/opt/jdk-21");
+    service.finish();
+}
+
+#[test]
+fn global_instance_defaults_apply_to_create() {
+    let service = Service::start("global-instance-defaults");
+    fs::write(service.directory.join("server.properties"), "motd=test\n").expect("defaults");
+    let defaults = service
+        .call(
+            1,
+            "settings.update",
+            json!({"type": "server", "create_defaults": false}),
+        )
+        .result
+        .expect("settings");
+    assert_eq!(defaults["type"], "server");
+    assert_eq!(defaults["create_defaults"], false);
+    assert!(defaults["loader"].is_null());
+
+    let server = service
+        .call(
+            2,
+            "instance.create",
+            json!({"id": "srv", "minecraft": "1.21.1"}),
+        )
+        .result
+        .expect("create server");
+    assert_eq!(server["instance"]["kind"], "server");
+    assert!(
+        !service
+            .directory
+            .join("instances/srv/server.properties")
+            .exists()
+    );
+
+    let rejected = service.call(
+        3,
+        "settings.update",
+        json!({"type": "client", "loader": "purpur"}),
+    );
+    assert_eq!(rejected.error.expect("purpur is server only").code, -32602);
+
+    service
+        .call(
+            4,
+            "settings.update",
+            json!({"type": "client", "loader": "fabric"}),
+        )
+        .result
+        .expect("fabric client");
+    service
+        .call(
+            5,
+            "settings.update",
+            json!({"loader": "none", "create_defaults": true}),
+        )
+        .result
+        .expect("reset loader");
+
+    let client = service
+        .call(
+            6,
+            "instance.create",
+            json!({"id": "cli", "minecraft": "1.20.4"}),
+        )
+        .result
+        .expect("create client");
+    assert_eq!(client["instance"]["kind"], "client");
+
+    let explicit = service
+        .call(
+            7,
+            "instance.create",
+            json!({"id": "srv2", "minecraft": "1.21.1", "type": "server"}),
+        )
+        .result
+        .expect("explicit type");
+    assert_eq!(explicit["instance"]["kind"], "server");
+    assert!(
+        service
+            .directory
+            .join("instances/srv2/server.properties")
+            .exists()
     );
     service.finish();
 }
@@ -600,7 +878,7 @@ fn moves_instance_id() {
         .expect("move");
     assert_eq!(moved["id"], "moved");
     let info = service
-        .call(4, "instance.get", json!({}))
+        .call(4, "instance.info", json!({}))
         .result
         .expect("default info");
     assert_eq!(info["id"], "moved");
@@ -796,7 +1074,7 @@ fn manages_accounts() {
             .is_some_and(|value| value > 0)
     );
     assert!(
-        offline["uuid"]
+        offline["id"]
             .as_str()
             .is_some_and(|uuid| uuid.contains('-'))
     );
@@ -816,7 +1094,7 @@ fn manages_accounts() {
         .call(
             3,
             "account.add",
-            json!({"kind": "microsoft", "name": "Ms", "uuid": "00000000-0000-0000-0000-000000000001", "access_token": "token", "refresh_token": "refresh"}),
+            json!({"kind": "microsoft", "name": "Ms", "id": "00000000-0000-0000-0000-000000000001", "access_token": "token", "refresh_token": "refresh"}),
         )
         .result
         .expect("microsoft");
@@ -829,7 +1107,7 @@ fn manages_accounts() {
         .expect("list");
     assert_eq!(list.as_array().expect("array").len(), 3);
 
-    let id = offline["id"].as_str().expect("id").to_owned();
+    let id = offline["id"].as_str().expect("uuid").to_owned();
     service
         .call(5, "account.remove", json!({"id": id}))
         .result
@@ -853,6 +1131,78 @@ fn manages_accounts() {
 }
 
 #[test]
+fn queries_account_info() {
+    let service = Service::start("account-info");
+    let added = service
+        .call(
+            1,
+            "account.add",
+            json!({"kind": "offline", "name": "Player"}),
+        )
+        .result
+        .expect("add");
+    let uuid = added["id"].as_str().expect("uuid").to_owned();
+
+    let info = service
+        .call(2, "account.info", json!({"id": uuid}))
+        .result
+        .expect("info");
+    assert_eq!(info["name"], "Player");
+    assert_eq!(info["kind"], "offline");
+
+    let missing = service.call(
+        3,
+        "account.info",
+        json!({"id": "00000000-0000-0000-0000-0000000000ff"}),
+    );
+    assert_eq!(missing.error.expect("missing").code, -32602);
+
+    let invalid = service.call(4, "account.info", json!({}));
+    assert_eq!(invalid.error.expect("id required").code, -32602);
+    service.finish();
+}
+
+#[test]
+fn queries_and_clears_default_account() {
+    let service = Service::start("account-default-query");
+    let added = service
+        .call(
+            1,
+            "account.add",
+            json!({"kind": "offline", "name": "Player"}),
+        )
+        .result
+        .expect("add");
+    let uuid = added["id"].as_str().expect("uuid").to_owned();
+
+    let response = service.call(2, "account.default", json!({}));
+    assert!(response.error.is_none(), "error: {:?}", response.error);
+    let none = response.result.unwrap_or(Value::Null);
+    assert!(none.is_null());
+
+    service
+        .call(3, "account.default", json!({"value": uuid}))
+        .result
+        .expect("set");
+    let found = service
+        .call(4, "account.default", json!({}))
+        .result
+        .expect("query");
+    assert_eq!(found["id"], uuid);
+
+    service
+        .call(5, "account.remove", json!({"id": uuid}))
+        .result
+        .expect("remove");
+    let cleared = service
+        .call(6, "account.default", json!({}))
+        .result
+        .unwrap_or(Value::Null);
+    assert!(cleared.is_null());
+    service.finish();
+}
+
+#[test]
 fn resolves_instance_account_by_name() {
     let service = Service::start("account-name");
     let offline = service
@@ -863,7 +1213,7 @@ fn resolves_instance_account_by_name() {
         )
         .result
         .expect("offline");
-    let id = offline["id"].as_str().expect("id").to_owned();
+    let id = offline["id"].as_str().expect("uuid").to_owned();
 
     let created = service
         .call(

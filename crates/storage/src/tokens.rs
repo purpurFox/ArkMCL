@@ -19,11 +19,11 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// 一组账户令牌。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenSet {
-    /// OAuth 刷新令牌。
-    pub refresh_token: String,
     /// 最近一次 Minecraft 访问令牌。
     #[serde(default)]
     pub access_token: Option<String>,
+    /// OAuth 刷新令牌。
+    pub refresh_token: String,
     /// 访问令牌过期时间（Unix 秒）。
     #[serde(default)]
     pub expires_at: Option<u64>,
@@ -249,6 +249,30 @@ mod tests {
         assert_eq!(mode, 0o600);
         store.remove("account").expect("remove");
         assert!(store.get("account").expect("get").is_none());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn writes_fields_in_config_order() {
+        let directory = temp_dir("order");
+        let store = Store::new(directory.join("tokens.json"));
+        store
+            .set(
+                "account",
+                &TokenSet {
+                    access_token: Some("access".to_owned()),
+                    refresh_token: "refresh".to_owned(),
+                    expires_at: Some(1),
+                },
+            )
+            .expect("set");
+        let text = fs::read_to_string(directory.join("tokens.json")).expect("read");
+        let mut last = 0;
+        for key in ["access_token", "refresh_token", "expires_at"] {
+            let position = text.find(&format!("\"{key}\"")).expect(key);
+            assert!(position >= last, "field order: {key}");
+            last = position;
+        }
         let _ = fs::remove_dir_all(&directory);
     }
 }

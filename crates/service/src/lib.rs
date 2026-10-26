@@ -1,7 +1,7 @@
 //! `ArkMCL` 守护进程。
 //!
 //! 通过 Unix domain socket 暴露 JSON-RPC 2.0，当前提供：
-//! `server.info`、`server.shutdown`，以及实例、启动和账户接口。
+//! `server.info`、`server.stop`，以及实例、启动和账户接口。
 
 #[cfg(unix)]
 mod app;

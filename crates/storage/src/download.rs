@@ -18,9 +18,8 @@ const RESOURCES: &str = "https://resources.download.minecraft.net";
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const ATTEMPTS: u32 = 4;
-const DEFAULT_CONCURRENCY: usize = 4;
-const MAX_CONCURRENCY: usize = 8;
-const CONCURRENCY_ENV: &str = "ARKMCL_DOWNLOAD_CONCURRENCY";
+const DEFAULT_THREADS: usize = 8;
+const MAX_THREADS: usize = 64;
 
 /// 同名文件冲突策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,11 +158,11 @@ impl From<std::io::Error> for Error {
 pub struct Downloader {
     minecraft: PathBuf,
     agent: ureq::Agent,
-    concurrency: usize,
+    threads: usize,
 }
 
 impl Downloader {
-    /// 创建下载器；并发数取自 `ARKMCL_DOWNLOAD_CONCURRENCY`，默认 4。
+    /// 创建下载器；默认 8 个下载线程。
     #[must_use]
     pub fn new(minecraft: PathBuf) -> Self {
         let agent = ureq::AgentBuilder::new()
@@ -173,21 +172,21 @@ impl Downloader {
         Self {
             minecraft,
             agent,
-            concurrency: concurrency_from_env(),
+            threads: DEFAULT_THREADS,
         }
     }
 
-    /// 设置并发数；自动收敛到 `1..=8`。
+    /// 设置下载线程数；自动收敛到 `1..=64`。
     #[must_use]
-    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
-        self.concurrency = concurrency.clamp(1, MAX_CONCURRENCY);
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.clamp(1, MAX_THREADS);
         self
     }
 
-    /// 当前并发数。
+    /// 当前下载线程数。
     #[must_use]
-    pub fn concurrency(&self) -> usize {
-        self.concurrency
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// 生成版本与资源索引对应的下载任务。
@@ -229,6 +228,21 @@ impl Downloader {
         mode: Mode,
         progress: &dyn Progress,
     ) -> Result<Report, Error> {
+        self.run_with_threads(tasks, mode, progress, self.threads)
+    }
+
+    /// 用指定下载线程数执行任务列表。
+    ///
+    /// # Errors
+    ///
+    /// 任一任务在重试后仍失败时返回该错误。
+    pub fn run_with_threads(
+        &self,
+        tasks: &[Task],
+        mode: Mode,
+        progress: &dyn Progress,
+        threads: usize,
+    ) -> Result<Report, Error> {
         let total = tasks.len();
         progress.start(total);
         if total == 0 {
@@ -236,7 +250,7 @@ impl Downloader {
             progress.finish(&report);
             return Ok(report);
         }
-        let workers = self.concurrency.min(total);
+        let workers = threads.clamp(1, MAX_THREADS).min(total);
         let next = AtomicUsize::new(0);
         let outcomes: Mutex<Vec<Option<Result<bool, Error>>>> =
             Mutex::new((0..total).map(|_| None).collect());
@@ -575,13 +589,6 @@ fn commit(temporary: &Path, task: &Task, hasher: Sha1) -> Result<(), Error> {
     })
 }
 
-fn concurrency_from_env() -> usize {
-    std::env::var(CONCURRENCY_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .map_or(DEFAULT_CONCURRENCY, |value| value.clamp(1, MAX_CONCURRENCY))
-}
-
 fn retryable(error: &Error) -> bool {
     match error {
         Error::Status { code, .. } => crate::retry::retryable_status(*code),
@@ -731,19 +738,17 @@ mod tests {
     }
 
     #[test]
-    fn clamps_concurrency_to_supported_range() {
-        let directory = temp_dir("concurrency");
+    fn clamps_threads_to_supported_range() {
+        let directory = temp_dir("threads");
         assert_eq!(
-            Downloader::new(directory.clone())
-                .with_concurrency(0)
-                .concurrency(),
+            Downloader::new(directory.clone()).with_threads(0).threads(),
             1
         );
         assert_eq!(
             Downloader::new(directory.clone())
-                .with_concurrency(99)
-                .concurrency(),
-            8
+                .with_threads(999)
+                .threads(),
+            64
         );
         let _ = fs::remove_dir_all(&directory);
     }

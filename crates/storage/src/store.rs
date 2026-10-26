@@ -337,38 +337,42 @@ fn validate_name(name: &str) -> Result<(), Error> {
 }
 
 fn render_cfg(instance: &Instance) -> String {
-    let group = instance.group.as_deref().unwrap_or("");
     let account = instance.account.as_deref().unwrap_or("");
+    let fullscreen = instance.config.fullscreen;
+    let game_args =
+        serde_json::to_string(&instance.config.game_args).unwrap_or_else(|_| "[]".to_owned());
+    let group = instance.group.as_deref().unwrap_or("");
     let java_path = instance
         .config
         .java_path
         .as_ref()
         .map_or_else(String::new, |path| path.display().to_string());
-    let lwjgl = instance.config.lwjgl.as_deref().unwrap_or("");
+    let java_version = instance
+        .config
+        .java_version
+        .map_or_else(String::new, |version| version.to_string());
     let jvm_args =
         serde_json::to_string(&instance.config.jvm_args).unwrap_or_else(|_| "[]".to_owned());
-    let game_args =
-        serde_json::to_string(&instance.config.game_args).unwrap_or_else(|_| "[]".to_owned());
-    let last_launched_at = instance
-        .last_launched_at
-        .map_or_else(String::new, |value| value.to_string());
+    let last_crash_report = instance.last_crash_report.as_deref().unwrap_or("");
+    let last_crashed = instance.last_crashed;
     let last_exit_code = instance
         .last_exit_code
         .map_or_else(String::new, |code| code.to_string());
-    let last_crash_report = instance.last_crash_report.as_deref().unwrap_or("");
+    let lwjgl = instance.config.lwjgl.as_deref().unwrap_or("");
+    let memory_mb = instance.config.memory_mb;
+    let name = &instance.name;
     let kind = match instance.kind {
         Kind::Client => "client",
         Kind::Server => "server",
     };
+    let window_width = instance.config.window_width;
+    let created_at = instance.created_at;
+    let last_launched_at = instance
+        .last_launched_at
+        .map_or_else(String::new, |value| value.to_string());
+    let run_seconds = instance.run_seconds;
     format!(
-        "type={kind}\nname={}\ngroup={group}\naccount={account}\nmemory_mb={}\njava_path={java_path}\nlwjgl={lwjgl}\njvm_args={jvm_args}\ngame_args={game_args}\nwindow_width={}\nfullscreen={}\ncreated_at={}\nlast_launched_at={last_launched_at}\nrun_seconds={}\nlast_exit_code={last_exit_code}\nlast_crashed={}\nlast_crash_report={last_crash_report}\n",
-        instance.name,
-        instance.config.memory_mb,
-        instance.config.window_width,
-        instance.config.fullscreen,
-        instance.created_at,
-        instance.run_seconds,
-        instance.last_crashed
+        "account={account}\nfullscreen={fullscreen}\ngame_args={game_args}\ngroup={group}\njava_path={java_path}\njava_version={java_version}\njvm_args={jvm_args}\nlast_crash_report={last_crash_report}\nlast_crashed={last_crashed}\nlast_exit_code={last_exit_code}\nlwjgl={lwjgl}\nmemory_mb={memory_mb}\nname={name}\ntype={kind}\nwindow_width={window_width}\ncreated_at={created_at}\nlast_launched_at={last_launched_at}\nrun_seconds={run_seconds}\n"
     )
 }
 
@@ -425,9 +429,16 @@ fn parse_cfg(text: &str) -> Result<Parsed, Error> {
         .get("java_path")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
+    let java_version = values
+        .get("java_version")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<u32>())
+        .transpose()
+        .map_err(|_| Error::InvalidFormat("invalid java_version".to_owned()))?;
     let config = Config {
         memory_mb: parse_value(&values, "memory_mb", 2048)?,
         java_path,
+        java_version,
         lwjgl: values
             .get("lwjgl")
             .filter(|lwjgl| !lwjgl.is_empty())
@@ -590,6 +601,42 @@ mod tests {
         let loaded = repo.load(&instance.id).expect("load");
         assert_eq!(loaded.state, State::Ready);
         assert_eq!(loaded.config.memory_mb, 4096);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn writes_instance_cfg_in_config_order() {
+        let (repo, directory) = repository("order");
+        let instance = repo.create(&NewInstance::new("Order")).expect("create");
+        let text =
+            fs::read_to_string(instance.root.join(".arkmcl/instance.cfg")).expect("read cfg");
+        let keys: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(key, _)| key))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "account",
+                "fullscreen",
+                "game_args",
+                "group",
+                "java_path",
+                "java_version",
+                "jvm_args",
+                "last_crash_report",
+                "last_crashed",
+                "last_exit_code",
+                "lwjgl",
+                "memory_mb",
+                "name",
+                "type",
+                "window_width",
+                "created_at",
+                "last_launched_at",
+                "run_seconds",
+            ]
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 

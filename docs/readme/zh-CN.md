@@ -50,7 +50,9 @@ cargo run -p arkmcl-cli -- --lang zh-CN service stop
 # 实例
 cargo run -p arkmcl-cli -- --lang zh-CN instance my-instance --create --name "My Instance" --version 1.20.4
 cargo run -p arkmcl-cli -- --lang zh-CN instance fabric-demo --create --name "Fabric Demo" --version 1.20.4 --loader fabric --loader-version 0.15.11
+cargo run -p arkmcl-cli -- --lang zh-CN instance           # 输出全局默认项
 cargo run -p arkmcl-cli -- --lang zh-CN instance --list
+cargo run -p arkmcl-cli -- --lang zh-CN instance my-instance          # 输出实例信息（同 --info）
 cargo run -p arkmcl-cli -- --lang zh-CN instance my-instance --info
 cargo run -p arkmcl-cli -- --lang zh-CN instance my-instance --default
 cargo run -p arkmcl-cli -- --lang zh-CN instance my-instance --memory 4096 --jvm-args "-Xmx4G -Dfoo=bar"
@@ -60,6 +62,7 @@ cargo run -p arkmcl-cli -- --lang zh-CN instance my-instance --loader none
 cargo run -p arkmcl-cli -- --lang zh-CN instance --group
 cargo run -p arkmcl-cli -- --lang zh-CN launch my-instance --prepare
 cargo run -p arkmcl-cli -- --lang zh-CN launch my-instance --start
+cargo run -p arkmcl-cli -- --lang zh-CN launch my-instance          # 进入控制台（同 --terminal）
 cargo run -p arkmcl-cli -- --lang zh-CN launch my-instance --terminal
 cargo run -p arkmcl-cli -- --lang zh-CN launch --list
 cargo run -p arkmcl-cli -- --lang zh-CN launch my-instance --stop
@@ -70,6 +73,7 @@ cargo run -p arkmcl-cli -- --lang zh-CN account --refresh
 cargo run -p arkmcl-cli -- --lang zh-CN account Player --add
 cargo run -p arkmcl-cli -- --lang zh-CN account Ext --add --server https://example.com/auth
 cargo run -p arkmcl-cli -- --lang zh-CN account --add   # 微软设备码登录
+cargo run -p arkmcl-cli -- --lang zh-CN account Player --info
 cargo run -p arkmcl-cli -- --lang zh-CN account Player --default
 cargo run -p arkmcl-cli -- --lang zh-CN account Player --remove
 
@@ -84,7 +88,8 @@ cargo run -p arkmcl-cli -- --lang zh-CN resource --list-remote --filter-loader n
 
 - socket 默认位于 `$XDG_RUNTIME_DIR/com.purft.arkmcl/arkmcl.sock`。
 - `XDG_RUNTIME_DIR` 缺失时退化到 `$XDG_STATE_HOME/com.purft.arkmcl/run/arkmcl.sock`。
-- 当前 RPC：`server.info`、`server.shutdown`、`instance.*`、`launch.*`、`account.add/list/default/remove`。
+- 当前 RPC：`server.info`、`server.stop`、`instance.*`、`launch.*`、`account.add/info/list/default/remove`。
+- 协议握手：`server.info` 返回 `protocol` 与 `capabilities`；CLI 首次连接校验主版本，不兼容时拒绝继续。
 
 ### Shell 补全
 
@@ -143,7 +148,7 @@ flutter test
 
 - Rust workspace：`arkmcl-core`、`arkmcl-l10n`、`arkmcl-platform`、`arkmcl-storage`、`arkmcl-cli`、`arkmcl-service`
 - CLI：`account`、`instance`、`launch`、`resource`，支持分组列表、通配符、批量确认与 `--json`，中英双语；服务未运行时自动启动 `arkmcl-service`（`ARKMCL_NO_AUTOSTART=1` 禁用，`service status`/`stop` 不自动启动）；帮助条目按字母升序排列
-- 服务端：Unix socket + JSON-RPC，支持 info、shutdown，实例 CRUD、配置更新与锁检查
+- 服务端：Unix socket + JSON-RPC，支持 info、stop，实例 CRUD、配置更新与锁检查
 - 路径解析：XDG 默认、显式环境变量、便携模式（默认禁用）
 - 实例仓储：JSON 存储、ID 分配、配置校验、原子写
 - 时间统计：实例创建/最近启动/累计运行，账户创建/最近使用/累计运行；用于列表排序
@@ -164,7 +169,7 @@ flutter test
 - 资源依赖：Modrinth 递归解析 `required` 依赖，`incompatible` 冲突会报错，结果包含 `resolved`
 - `--autoremove`：列出未被任何实例引用的全局 mods/resourcepacks/shaderpacks/datapacks；`--yes` 移动到回收站
 - 系统密钥环：优先使用 `secret-tool`，不可用时回退 `tokens.json`
-- 全局默认项：保存在 `settings.json` 的 `instance` 字段；不带选择器时 `--memory|--version|--jvm-args|--group` 读写全局默认；带选择器且不带值时输出该实例的当前设置"
+- 全局默认项：保存在 `settings.json` 的 `instance` 字段；不带选择器时 `--memory|--version|--jvm-args|--group|--type|--loader|--create-defaults` 读写全局默认；带选择器且不带值时输出该实例的当前设置，其中 `--type` 与 `--create-defaults` 仅能用于全局默认
 - natives 解压：按 `extract.exclude` 过滤，使用 ZIP `enclosed_name` 防路径穿越
 - 启动准备：`launch <id> --prepare` 抓取元数据、合并 loader、下载依赖、解压 natives，并返回启动计划
 - 启动执行：`launch <id> --start`、`launch <id> --terminal`、`launch --list`、`launch <id> --stop`；控制台转发 stdout/stderr 并接受 stdin，退出码与崩溃报告写入实例状态；日志写入实例 `logs/latest.log`

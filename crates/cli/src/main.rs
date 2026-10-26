@@ -25,6 +25,9 @@ mod completion;
 /// `--json` 时禁止进度输出，避免污染机器可读结果。
 static QUIET_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// 是否已完成与服务端的协议握手。
+static PROTOCOL_CHECKED: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args_os()
         .skip(1)
@@ -141,8 +144,8 @@ fn service_command(args: &[String], catalog: &Catalog) -> ExitCode {
     }
 
     match subcommand.as_str() {
-        "status" => status(catalog),
-        "stop" => call_simple(catalog, "server.shutdown", "cli.stop"),
+        "status" => service_status(catalog),
+        "stop" => service_stop(catalog),
         other => unknown(catalog, &format!("service {other}")),
     }
 }
@@ -154,6 +157,10 @@ fn service_command(_args: &[String], catalog: &Catalog) -> ExitCode {
 }
 
 #[cfg(unix)]
+fn service_stop(catalog: &Catalog) -> ExitCode {
+    call_simple(catalog, "server.stop", "cli.stop")
+}
+
 fn call_simple(catalog: &Catalog, method: &str, message_key: &str) -> ExitCode {
     match request_with(catalog, method, json!({}), false) {
         Ok(response) => {
@@ -172,8 +179,8 @@ fn call_simple(catalog: &Catalog, method: &str, message_key: &str) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn status(catalog: &Catalog) -> ExitCode {
-    let response = match request_with(catalog, "server.info", json!({}), false) {
+fn service_status(catalog: &Catalog) -> ExitCode {
+    let response = match request_with(catalog, "server.status", json!({}), false) {
         Ok(response) => response,
         Err(code) => return code,
     };
@@ -382,6 +389,63 @@ fn request(
 }
 
 fn request_with(
+    catalog: &Catalog,
+    method: &str,
+    params: Value,
+    autostart: bool,
+) -> Result<arkmcl_platform::ipc::Response, ExitCode> {
+    if method != "server.info" {
+        ensure_protocol(catalog, autostart)?;
+    }
+    send_request(catalog, method, params, autostart)
+}
+
+fn ensure_protocol(catalog: &Catalog, autostart: bool) -> Result<(), ExitCode> {
+    if PROTOCOL_CHECKED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let response = send_request(catalog, "server.info", json!({}), autostart)?;
+    if let Some(fault) = response.error {
+        eprintln!(
+            "{}",
+            catalog.format("cli.error.rpc", &[("message", &fault.message)])
+        );
+        return Err(ExitCode::from(1));
+    }
+    let protocol = response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("protocol"))
+        .and_then(Value::as_u64);
+    match protocol {
+        Some(version) if version == u64::from(arkmcl_platform::ipc::PROTOCOL_VERSION) => {
+            PROTOCOL_CHECKED.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        Some(version) => {
+            eprintln!(
+                "{}",
+                catalog.format(
+                    "cli.error.protocol",
+                    &[
+                        ("server", &version.to_string()),
+                        (
+                            "client",
+                            &arkmcl_platform::ipc::PROTOCOL_VERSION.to_string()
+                        ),
+                    ]
+                )
+            );
+            Err(ExitCode::from(1))
+        }
+        None => {
+            eprintln!("{}", catalog.text("cli.error.protocol_missing"));
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
+fn send_request(
     catalog: &Catalog,
     method: &str,
     params: Value,
@@ -680,7 +744,6 @@ fn sort_name(value: &Value) -> &str {
         .get("name")
         .and_then(Value::as_str)
         .or_else(|| value.get("id").and_then(Value::as_str))
-        .or_else(|| value.get("uuid").and_then(Value::as_str))
         .unwrap_or("")
 }
 
@@ -756,8 +819,8 @@ fn select<'a>(
                 .any(|name| wildcard(pattern, field(value, name)))
         });
         if matched {
-            let id = field(value, "id");
-            if seen.insert(id.to_owned()) {
+            let key = field(value, "id");
+            if seen.insert(key.to_owned()) {
                 selected.push(value);
             }
         }
@@ -832,7 +895,7 @@ fn print_accounts(values: &[Value], catalog: &Catalog) {
             println!(
                 "  {}  {}  {server}",
                 field(account, "name"),
-                field(account, "uuid")
+                field(account, "id")
             );
         }
     }
@@ -903,7 +966,9 @@ fn account_command(args: &[String], catalog: &Catalog) -> ExitCode {
         args,
         &["server", "list-sort", "list-sort-by"],
         &[],
-        &["add", "remove", "default", "refresh", "list", "json", "yes"],
+        &[
+            "add", "remove", "default", "refresh", "info", "list", "json", "yes",
+        ],
         catalog,
     ) {
         Ok(parsed) => parsed,
@@ -913,6 +978,33 @@ fn account_command(args: &[String], catalog: &Catalog) -> ExitCode {
         print!("{}", catalog.text("cli.help"));
         return ExitCode::SUCCESS;
     }
+    if parsed.flag("list")
+        && (parsed.flag("add")
+            || parsed.flag("remove")
+            || parsed.flag("default")
+            || parsed.flag("refresh")
+            || parsed.flag("info"))
+    {
+        return unexpected(catalog, "--list");
+    }
+    if parsed.flag("info")
+        && (parsed.flag("add")
+            || parsed.flag("remove")
+            || parsed.flag("default")
+            || parsed.flag("refresh"))
+    {
+        return unexpected(catalog, "--info");
+    }
+    if parsed.flag("add")
+        || parsed.flag("remove")
+        || parsed.flag("default")
+        || parsed.flag("refresh")
+        || parsed.flag("info")
+    {
+        if let Some(code) = reject_flags(&parsed, catalog, &["list-sort", "list-sort-by"]) {
+            return code;
+        }
+    }
     if parsed.flag("add") && parsed.flag("remove") {
         return unexpected(catalog, "--remove");
     }
@@ -921,25 +1013,73 @@ fn account_command(args: &[String], catalog: &Catalog) -> ExitCode {
     {
         return unexpected(catalog, "--refresh");
     }
+    if parsed.flag("remove") && parsed.flag("default") {
+        return unexpected(catalog, "--default");
+    }
+    if parsed.value("server").is_some() && !parsed.flag("add") {
+        return missing_flag(catalog, "--add");
+    }
+    if parsed.flag("add") && parsed.flag("default") {
+        return account_add_action(&parsed, catalog, true);
+    }
     if parsed.flag("default") {
-        if parsed.flag("add") || parsed.flag("remove") {
-            return unexpected(catalog, "--default");
-        }
         return account_default_action(&parsed, catalog);
     }
     if parsed.flag("add") {
-        return account_add_action(&parsed, catalog);
+        return account_add_action(&parsed, catalog, false);
     }
     if parsed.flag("remove") {
         return account_remove_action(&parsed, catalog);
     }
-    if parsed.value("server").is_some() {
-        return missing_flag(catalog, "--add");
-    }
     if parsed.flag("refresh") {
         return account_refresh_action(&parsed, catalog);
     }
+    if parsed.flag("info") {
+        return account_info_action(&parsed, catalog);
+    }
     account_list_action(&parsed, catalog)
+}
+
+#[cfg(unix)]
+fn account_info_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    if parsed.positionals.is_empty() {
+        let value = match call(catalog, "account.default", json!({})) {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
+        if value.is_null() {
+            if parsed.flag("json") {
+                return print_json(&Value::Null);
+            }
+            println!("{}", catalog.text("cli.account.default_none"));
+            return ExitCode::SUCCESS;
+        }
+        return print_json(&value);
+    }
+    let values = match call(catalog, "account.list", json!({})) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    let values = values.as_array().cloned().unwrap_or_default();
+    let selected = match select(&values, &parsed.positionals, &["id", "name"], catalog) {
+        Ok(selected) => selected,
+        Err(code) => return code,
+    };
+    let mut results = Vec::new();
+    for account in &selected {
+        match call(
+            catalog,
+            "account.info",
+            json!({ "id": field(account, "id") }),
+        ) {
+            Ok(value) => results.push(value),
+            Err(code) => return code,
+        }
+    }
+    if results.len() == 1 {
+        return print_json(&results[0]);
+    }
+    print_json(&Value::Array(results))
 }
 
 #[cfg(unix)]
@@ -949,12 +1089,7 @@ fn account_list_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         Err(code) => return code,
     };
     let values = values.as_array().cloned().unwrap_or_default();
-    let selected = match select(
-        &values,
-        &parsed.positionals,
-        &["id", "uuid", "name"],
-        catalog,
-    ) {
+    let selected = match select(&values, &parsed.positionals, &["id", "name"], catalog) {
         Ok(selected) => selected,
         Err(code) => return code,
     };
@@ -981,7 +1116,18 @@ fn account_list_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 #[cfg(unix)]
 fn account_default_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if parsed.positionals.is_empty() {
-        return missing_flag(catalog, "<uuid|name>");
+        let value = match call(catalog, "account.default", json!({})) {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
+        if value.is_null() {
+            if parsed.flag("json") {
+                return print_json(&Value::Null);
+            }
+            println!("{}", catalog.text("cli.account.default_none"));
+            return ExitCode::SUCCESS;
+        }
+        return print_json(&value);
     }
     if parsed.positionals.len() != 1 {
         eprintln!(
@@ -1002,27 +1148,19 @@ fn account_default_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             .filter(|account| field(account, "name") == pattern)
             .collect();
         if matches.len() > 1 {
-            let uuids = matches
+            let ids = matches
                 .iter()
-                .map(|account| field(account, "uuid"))
+                .map(|account| field(account, "id"))
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!(
                 "{}",
-                catalog.format(
-                    "cli.error.ambiguous",
-                    &[("value", pattern), ("uuids", &uuids)]
-                )
+                catalog.format("cli.error.ambiguous", &[("value", pattern), ("ids", &ids)])
             );
             return ExitCode::from(2);
         }
     }
-    let selected = match select(
-        &values,
-        &parsed.positionals,
-        &["id", "uuid", "name"],
-        catalog,
-    ) {
+    let selected = match select(&values, &parsed.positionals, &["id", "name"], catalog) {
         Ok(selected) => selected,
         Err(code) => return code,
     };
@@ -1106,7 +1244,7 @@ fn account_refresh_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 #[cfg(unix)]
 fn account_remove_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if parsed.positionals.is_empty() {
-        return missing_flag(catalog, "<uuid|name>");
+        return missing_flag(catalog, "<id|name>");
     }
     let values = match call(catalog, "account.list", json!({})) {
         Ok(value) => value,
@@ -1122,27 +1260,19 @@ fn account_remove_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             .filter(|account| field(account, "name") == pattern)
             .collect();
         if matches.len() > 1 {
-            let uuids = matches
+            let ids = matches
                 .iter()
-                .map(|account| field(account, "uuid"))
+                .map(|account| field(account, "id"))
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!(
                 "{}",
-                catalog.format(
-                    "cli.error.ambiguous",
-                    &[("value", pattern), ("uuids", &uuids)]
-                )
+                catalog.format("cli.error.ambiguous", &[("value", pattern), ("ids", &ids)])
             );
             return ExitCode::from(2);
         }
     }
-    let selected = match select(
-        &values,
-        &parsed.positionals,
-        &["id", "uuid", "name"],
-        catalog,
-    ) {
+    let selected = match select(&values, &parsed.positionals, &["id", "name"], catalog) {
         Ok(selected) => selected,
         Err(code) => return code,
     };
@@ -1175,7 +1305,7 @@ fn account_remove_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn account_add_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+fn account_add_action(parsed: &CommandArgs, catalog: &Catalog, set_default: bool) -> ExitCode {
     if parsed.positionals.len() > 1 {
         eprintln!(
             "{}",
@@ -1189,45 +1319,61 @@ fn account_add_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             return missing_flag(catalog, "<name>");
         };
         let params = json!({"kind": "external", "name": name, "server": server});
-        return finish(catalog, request(catalog, "account.add", params));
+        return submit_account(catalog, params, set_default);
     }
     if let Some(name) = name {
-        return finish(
+        return submit_account(
             catalog,
-            request(
-                catalog,
-                "account.add",
-                json!({"kind": "offline", "name": name}),
-            ),
+            json!({"kind": "offline", "name": name}),
+            set_default,
         );
     }
-    account_login_msa(catalog)
+    account_login_msa(catalog, set_default)
+}
+
+fn submit_account(catalog: &Catalog, params: serde_json::Value, set_default: bool) -> ExitCode {
+    let added = match call(catalog, "account.add", params) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    if !set_default {
+        return print_json(&added);
+    }
+    let Some(id) = added.get("id").and_then(Value::as_str) else {
+        eprintln!(
+            "{}",
+            catalog.format(
+                "cli.error.rpc",
+                &[("message", "account response has no id")]
+            )
+        );
+        return ExitCode::from(1);
+    };
+    match call(catalog, "account.default", json!({ "value": id })) {
+        Ok(value) => print_json(&value),
+        Err(code) => code,
+    }
 }
 
 #[cfg(unix)]
 fn instance_command(args: &[String], catalog: &Catalog) -> ExitCode {
     let parsed = match parse_command_args(
         args,
-        &[
-            "list-sort",
-            "list-sort-by",
-            "create-defaults",
-            "move",
-            "group-move",
-            "import",
-        ],
+        &["list-sort", "list-sort-by", "move", "group-move", "import"],
         &[
             "group",
-            "linking",
+            "link",
             "name",
             "memory",
             "jvm-args",
+            "java",
             "version",
             "lwjgl",
             "loader",
             "loader-version",
             "type",
             "account",
+            "create-defaults",
         ],
         &["list", "info", "default", "create", "remove", "json", "yes"],
         catalog,
@@ -1238,6 +1384,24 @@ fn instance_command(args: &[String], catalog: &Catalog) -> ExitCode {
     if parsed.help {
         print!("{}", catalog.text("cli.help"));
         return ExitCode::SUCCESS;
+    }
+    if let Some(flag) = action_conflict(
+        &parsed,
+        &[
+            "create",
+            "import",
+            "remove",
+            "default",
+            "info",
+            "list",
+            "move",
+            "group-move",
+        ],
+    ) {
+        return unexpected(catalog, &format!("--{flag}"));
+    }
+    if let Some(code) = validate_instance_actions(&parsed, catalog) {
+        return code;
     }
     if parsed.flag("create") {
         return instance_create_action(&parsed, catalog);
@@ -1257,13 +1421,36 @@ fn instance_command(args: &[String], catalog: &Catalog) -> ExitCode {
     if parsed.flag("list") {
         return instance_list_action(&parsed, catalog);
     }
+    if parsed.flag("java") && parsed.value("java").is_none() {
+        return instance_java_query(&parsed, catalog);
+    }
     if instance_has_setters(&parsed) {
         return instance_update_action(&parsed, catalog);
     }
     if parsed.flag("group") && parsed.value("group").is_none() && parsed.positionals.is_empty() {
         return instance_groups_action(catalog);
     }
-    instance_list_action(&parsed, catalog)
+    if parsed.positionals.is_empty() {
+        return instance_defaults_action(&parsed, catalog);
+    }
+    instance_info_action(&parsed, catalog)
+}
+
+#[cfg(unix)]
+fn instance_defaults_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    let value = match call(catalog, "settings.get", json!({})) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    if parsed.flag("json") {
+        return print_json(&value);
+    }
+    if let Some(object) = value.as_object() {
+        for (key, value) in object {
+            println!("{key} = {value}");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn instance_has_setters(parsed: &CommandArgs) -> bool {
@@ -1271,15 +1458,18 @@ fn instance_has_setters(parsed: &CommandArgs) -> bool {
         || parsed.value("type").is_some()
         || parsed.value("memory").is_some()
         || parsed.value("jvm-args").is_some()
+        || parsed.value("java").is_some()
         || parsed.value("version").is_some()
         || parsed.value("lwjgl").is_some()
         || parsed.value("loader").is_some()
         || parsed.value("loader-version").is_some()
-        || parsed.value("linking").is_some()
-        || (parsed.flag("linking") && parsed.value("linking").is_none())
+        || parsed.value("link").is_some()
+        || (parsed.flag("link") && parsed.value("link").is_none())
         || parsed.value("group-move").is_some()
         || parsed.value("move").is_some()
         || parsed.value("account").is_some()
+        || parsed.value("create-defaults").is_some()
+        || (parsed.flag("create-defaults") && parsed.value("create-defaults").is_none())
         || (parsed.flag("group") && parsed.value("group").is_some())
         || instance_query_flags(parsed).next().is_some()
 }
@@ -1311,7 +1501,7 @@ fn instance_import_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         }
         params["type"] = json!(kind);
     }
-    if let Some(linking) = parsed.value("linking") {
+    if let Some(linking) = parsed.value("link") {
         params["linking"] = json!(linking);
     }
     if let Some(group) = parsed.value("group") {
@@ -1348,6 +1538,9 @@ fn instance_import_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 #[cfg(unix)]
 #[allow(clippy::too_many_lines)] // flag validation; split when more fields are added
 fn instance_create_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    if parsed.flag("java") && parsed.value("java").is_none() {
+        return missing_flag(catalog, "--java");
+    }
     if parsed.positionals.len() > 1 {
         eprintln!(
             "{}",
@@ -1365,9 +1558,10 @@ fn instance_create_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             return missing_flag(catalog, "--version");
         }
     }
-    let defaults = match parsed.value("create-defaults") {
-        None | Some("true") => true,
-        Some("false") => false,
+    let create_defaults = match parsed.value("create-defaults") {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
         Some(value) => {
             eprintln!(
                 "{}",
@@ -1376,36 +1570,46 @@ fn instance_create_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let requested_type = parsed.value("type");
-    let kind = match requested_type.map(str::to_ascii_lowercase).as_deref() {
-        None | Some("client") => "client",
-        Some("server") => "server",
+    if parsed.flag("create-defaults") && create_defaults.is_none() {
+        return missing_flag(catalog, "--create-defaults");
+    }
+    let requested_type = parsed.value("type").map(str::to_ascii_lowercase);
+    let kind = match requested_type.as_deref() {
+        None => None,
+        Some("client") => Some("client"),
+        Some("server") => Some("server"),
         Some(_) => {
             eprintln!(
                 "{}",
-                catalog.format("cli.error.type", &[("value", requested_type.unwrap_or(""))])
+                catalog.format(
+                    "cli.error.type",
+                    &[("value", requested_type.as_deref().unwrap_or(""))]
+                )
             );
             return ExitCode::from(2);
         }
     };
-    if parsed.value("loader-version").is_some() && parsed.value("loader").is_none() {
+    if parsed.value("loader-version").is_some()
+        && matches!(parsed.value("loader"), None | Some("none"))
+    {
         eprintln!("{}", catalog.text("cli.error.loader_version"));
         return ExitCode::from(2);
     }
     if let Some(loader) = parsed.value("loader") {
-        if !matches!(loader, "none" | "vanilla") {
-            if !matches!(loader, "fabric" | "quilt" | "forge" | "neoforge" | "purpur") {
-                eprintln!(
-                    "{}",
-                    catalog.format("cli.error.loader", &[("loader", loader)])
-                );
-                return ExitCode::from(2);
-            }
-            let allowed = if kind == "server" {
-                matches!(loader, "purpur" | "fabric" | "forge" | "neoforge")
-            } else {
-                matches!(loader, "fabric" | "quilt" | "forge" | "neoforge")
-            };
+        if !matches!(loader, "none" | "fabric" | "forge" | "neoforge" | "purpur") {
+            eprintln!(
+                "{}",
+                catalog.format("cli.error.loader", &[("loader", loader)])
+            );
+            return ExitCode::from(2);
+        }
+        if let Some(kind) = kind {
+            let allowed = loader == "none"
+                || if kind == "server" {
+                    matches!(loader, "purpur" | "fabric" | "forge" | "neoforge")
+                } else {
+                    matches!(loader, "fabric" | "forge" | "neoforge")
+                };
             if !allowed {
                 eprintln!(
                     "{}",
@@ -1418,7 +1622,51 @@ fn instance_create_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             }
         }
     }
-    let mut params = json!({"type": kind, "defaults": defaults});
+    let memory = match parsed.value("memory") {
+        Some(raw) => {
+            if let Ok(value) = raw.parse::<u32>() {
+                Some(value)
+            } else {
+                eprintln!("{}", catalog.format("cli.error.memory", &[("value", raw)]));
+                return ExitCode::from(2);
+            }
+        }
+        None => None,
+    };
+    let memory_minimum = match kind {
+        Some("server") => 256,
+        Some(_) => 512,
+        None => match memory {
+            Some(memory) if memory < 512 => {
+                let settings = match call(catalog, "settings.get", json!({})) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                if settings.get("type").and_then(Value::as_str) == Some("server") {
+                    256
+                } else {
+                    512
+                }
+            }
+            _ => 512,
+        },
+    };
+    if let Some(memory) = memory {
+        if memory < memory_minimum {
+            eprintln!(
+                "{}",
+                catalog.format("cli.error.memory", &[("value", &memory.to_string())])
+            );
+            return ExitCode::from(2);
+        }
+    }
+    let mut params = json!({});
+    if let Some(kind) = kind {
+        params["type"] = json!(kind);
+    }
+    if let Some(defaults) = create_defaults {
+        params["defaults"] = json!(defaults);
+    }
     if let Some(name) = name {
         params["name"] = json!(name);
     }
@@ -1428,13 +1676,13 @@ fn instance_create_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if let Some(lwjgl) = parsed.value("lwjgl") {
         params["lwjgl"] = json!(lwjgl);
     }
+    if let Some(java) = parsed.value("java") {
+        params["java"] = json!(java);
+    }
     if let Some(id) = parsed.positionals.first() {
         params["id"] = json!(id);
     }
-    if let Some(loader) = parsed
-        .value("loader")
-        .filter(|loader| !matches!(*loader, "none" | "vanilla"))
-    {
+    if let Some(loader) = parsed.value("loader") {
         params["loader"] = json!(loader);
     }
     if let Some(loader_version) = parsed.value("loader-version") {
@@ -1446,25 +1694,10 @@ fn instance_create_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if let Some(group) = parsed.value("group") {
         params["group"] = json!(group);
     }
-    if let Some(linking) = parsed.value("linking") {
+    if let Some(linking) = parsed.value("link") {
         params["linking"] = json!(linking);
     }
-    if let Some(memory) = parsed.value("memory") {
-        let Ok(memory) = memory.parse::<u32>() else {
-            eprintln!(
-                "{}",
-                catalog.format("cli.error.memory", &[("value", memory)])
-            );
-            return ExitCode::from(2);
-        };
-        let minimum = if kind == "server" { 256 } else { 512 };
-        if memory < minimum {
-            eprintln!(
-                "{}",
-                catalog.format("cli.error.memory", &[("value", &memory.to_string())])
-            );
-            return ExitCode::from(2);
-        }
+    if let Some(memory) = memory {
         params["memory_mb"] = json!(memory);
     }
     if let Some(raw) = parsed.value("jvm-args") {
@@ -1503,7 +1736,7 @@ fn instance_remove_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     for instance in &selected {
         match call(
             catalog,
-            "instance.delete",
+            "instance.remove",
             json!({ "id": field(instance, "id") }),
         ) {
             Ok(value) => results.push(value),
@@ -1525,6 +1758,9 @@ fn instance_remove_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 
 #[cfg(unix)]
 fn instance_default_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    if parsed.positionals.is_empty() {
+        return finish(catalog, request(catalog, "instance.info", json!({})));
+    }
     if parsed.positionals.len() != 1 {
         eprintln!(
             "{}",
@@ -1560,7 +1796,7 @@ fn instance_default_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode 
 #[cfg(unix)]
 fn instance_info_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if parsed.positionals.is_empty() {
-        return finish(catalog, request(catalog, "instance.get", json!({})));
+        return finish(catalog, request(catalog, "instance.info", json!({})));
     }
     let values = match instance_list_values(catalog) {
         Ok(values) => values,
@@ -1574,7 +1810,7 @@ fn instance_info_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     for instance in &selected {
         match call(
             catalog,
-            "instance.get",
+            "instance.info",
             json!({ "id": field(instance, "id") }),
         ) {
             Ok(value) => results.push(value),
@@ -1587,7 +1823,7 @@ fn instance_info_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     print_json(&Value::Array(results))
 }
 
-const INSTANCE_QUERY_FLAGS: [&str; 10] = [
+const INSTANCE_QUERY_FLAGS: [&str; 11] = [
     "name",
     "version",
     "memory",
@@ -1598,6 +1834,7 @@ const INSTANCE_QUERY_FLAGS: [&str; 10] = [
     "type",
     "account",
     "group",
+    "create-defaults",
 ];
 
 fn instance_query_flags(parsed: &CommandArgs) -> impl Iterator<Item = &'static str> + '_ {
@@ -1610,12 +1847,22 @@ fn instance_query_flags(parsed: &CommandArgs) -> impl Iterator<Item = &'static s
 
 #[cfg(unix)]
 fn instance_query(parsed: &CommandArgs, flags: &[&str], catalog: &Catalog) -> ExitCode {
+    if !parsed.positionals.is_empty() && flags.contains(&"create-defaults") {
+        eprintln!(
+            "{}",
+            catalog.format("cli.error.global_setting", &[("flag", "--create-defaults")])
+        );
+        return ExitCode::from(2);
+    }
     let json_output = parsed.flag("json");
     if parsed.positionals.is_empty() {
         let mut global = Vec::new();
         let mut unsupported = None;
         for flag in flags {
-            if matches!(*flag, "version" | "memory" | "jvm-args" | "group") {
+            if matches!(
+                *flag,
+                "version" | "memory" | "jvm-args" | "group" | "type" | "loader" | "create-defaults"
+            ) {
                 global.push(*flag);
             } else if unsupported.is_none() {
                 unsupported = Some(*flag);
@@ -1637,6 +1884,7 @@ fn instance_query(parsed: &CommandArgs, flags: &[&str], catalog: &Catalog) -> Ex
             let key = match flag {
                 "memory" => "memory_mb",
                 "jvm-args" => "jvm_args",
+                "create-defaults" => "create_defaults",
                 other => other,
             };
             out.insert(
@@ -1665,7 +1913,7 @@ fn instance_query(parsed: &CommandArgs, flags: &[&str], catalog: &Catalog) -> Ex
     for instance in &selected {
         let value = match call(
             catalog,
-            "instance.get",
+            "instance.info",
             json!({"id": field(instance, "id")}),
         ) {
             Ok(value) => value,
@@ -1754,7 +2002,7 @@ fn instance_field(instance: &Value, flag: &str) -> Value {
                     return Value::String(label.to_owned());
                 }
             }
-            Value::String("vanilla".to_owned())
+            Value::Null
         }
         _ => Value::Null,
     }
@@ -1798,8 +2046,8 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             ),
         );
     }
-    if parsed.flag("linking") && parsed.value("linking").is_none() {
-        return instance_linking_query(parsed, catalog);
+    if parsed.flag("link") && parsed.value("link").is_none() {
+        return instance_link_query(parsed, catalog);
     }
     let queries: Vec<&str> = instance_query_flags(parsed).collect();
     if !queries.is_empty() {
@@ -1838,15 +2086,35 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         if let Some(value) = parsed.value("group") {
             update.insert("group".to_owned(), json!(value));
         }
-        if let Some(value) = parsed.value("linking") {
+        if let Some(value) = parsed.value("link") {
             if !matches!(value, "all" | "none") {
                 eprintln!(
                     "{}",
-                    catalog.format("cli.error.global_only", &[("flag", "--linking")])
+                    catalog.format("cli.error.global_only", &[("flag", "--link")])
                 );
                 return ExitCode::from(2);
             }
             update.insert("linking".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.value("java") {
+            update.insert("java".to_owned(), json!(value));
+        }
+        if let Some(value) = parsed.value("type") {
+            update.insert("type".to_owned(), json!(value.to_ascii_lowercase()));
+        }
+        if let Some(value) = parsed.value("loader") {
+            update.insert("loader".to_owned(), json!(value));
+        }
+        if let Some(raw) = parsed.value("create-defaults") {
+            let value = match raw {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    eprintln!("{}", catalog.format("cli.error.boolean", &[("value", raw)]));
+                    return ExitCode::from(2);
+                }
+            };
+            update.insert("create_defaults".to_owned(), json!(value));
         }
         if !update.is_empty() {
             return finish(
@@ -1854,14 +2122,7 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
                 request(catalog, "settings.update", Value::Object(update)),
             );
         }
-        for flag in [
-            "name",
-            "loader",
-            "loader-version",
-            "lwjgl",
-            "account",
-            "type",
-        ] {
+        for flag in ["name", "loader-version", "lwjgl", "account"] {
             if parsed.value(flag).is_some() {
                 eprintln!(
                     "{}",
@@ -1874,9 +2135,20 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if parsed.positionals.is_empty() {
         return missing_flag(catalog, "<id>");
     }
+    if parsed.value("create-defaults").is_some() {
+        eprintln!(
+            "{}",
+            catalog.format("cli.error.global_setting", &[("flag", "--create-defaults")])
+        );
+        return ExitCode::from(2);
+    }
+    if parsed.value("type").is_some() {
+        eprintln!("{}", catalog.text("cli.error.type_create"));
+        return ExitCode::from(2);
+    }
     let memory = match parsed.value("memory") {
         Some(raw) => match raw.parse::<u32>() {
-            Ok(value) if value >= 512 => Some(value),
+            Ok(value) if value >= 256 => Some(value),
             Ok(_) | Err(_) => {
                 eprintln!("{}", catalog.format("cli.error.memory", &[("value", raw)]));
                 return ExitCode::from(2);
@@ -1899,6 +2171,29 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         Ok(selected) => selected,
         Err(code) => return code,
     };
+    if let Some(memory) = memory {
+        let minimum = selected
+            .iter()
+            .map(|instance| {
+                if instance.get("kind").and_then(Value::as_str) == Some("server") {
+                    256
+                } else {
+                    512
+                }
+            })
+            .max()
+            .unwrap_or(512);
+        if memory < minimum {
+            eprintln!(
+                "{}",
+                catalog.format(
+                    "cli.error.memory",
+                    &[("value", parsed.value("memory").unwrap_or_default())]
+                )
+            );
+            return ExitCode::from(2);
+        }
+    }
     if selected.len() > 1 && !confirm(selected.len(), catalog, parsed.flag("yes")) {
         println!("{}", catalog.text("cli.confirm.cancelled"));
         return ExitCode::SUCCESS;
@@ -1920,7 +2215,7 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         let loader = loader.to_ascii_lowercase();
         if !matches!(
             loader.as_str(),
-            "fabric" | "quilt" | "forge" | "neoforge" | "purpur" | "none" | "vanilla"
+            "fabric" | "forge" | "neoforge" | "purpur" | "none"
         ) {
             eprintln!(
                 "{}",
@@ -1939,6 +2234,9 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if let Some(lwjgl) = parsed.value("lwjgl") {
         params["lwjgl"] = json!(lwjgl);
     }
+    if let Some(java) = parsed.value("java") {
+        params["java"] = json!(java);
+    }
     if let Some(raw) = parsed.value("jvm-args") {
         match parse_jvm_args(raw) {
             Ok(args) => params["jvm_args"] = json!(args),
@@ -1951,8 +2249,8 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             }
         }
     }
-    if let Some(raw) = parsed.value("linking") {
-        return instance_linking_action(&selected, raw, catalog, parsed.flag("json"));
+    if let Some(raw) = parsed.value("link") {
+        return instance_link_action(&selected, raw, catalog, parsed.flag("json"));
     }
     let mut results = Vec::new();
     for instance in &selected {
@@ -1977,7 +2275,7 @@ fn instance_update_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn instance_linking_query(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+fn instance_link_query(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if parsed.positionals.is_empty() {
         let value = match call(catalog, "settings.get", json!({})) {
             Ok(value) => value,
@@ -1987,7 +2285,7 @@ fn instance_linking_query(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             return print_json(&value);
         }
         println!(
-            "linking = {}",
+            "link = {}",
             value.get("linking").cloned().unwrap_or(Value::Null)
         );
         return ExitCode::SUCCESS;
@@ -2075,7 +2373,7 @@ fn instance_group_move_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCo
 }
 
 #[cfg(unix)]
-fn instance_linking_action(
+fn instance_link_action(
     selected: &[&Value],
     raw: &str,
     catalog: &Catalog,
@@ -2091,10 +2389,7 @@ fn instance_linking_action(
                 .filter(|name| !name.is_empty())
                 .collect();
             if names.is_empty() {
-                eprintln!(
-                    "{}",
-                    catalog.format("cli.error.linking", &[("value", value)])
-                );
+                eprintln!("{}", catalog.format("cli.error.link", &[("value", value)]));
                 return ExitCode::from(2);
             }
             (json!(names), false)
@@ -2189,6 +2484,48 @@ fn instance_list_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 }
 
 #[cfg(unix)]
+fn instance_java_query(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    if parsed.positionals.is_empty() {
+        let settings = match call(catalog, "settings.get", json!({})) {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
+        let java = settings
+            .get("java")
+            .cloned()
+            .unwrap_or_else(|| json!("default"));
+        if parsed.flag("json") {
+            return print_json(&json!({ "java": java }));
+        }
+        println!("java = {}", java.as_str().unwrap_or("default"));
+        return ExitCode::SUCCESS;
+    }
+    if parsed.positionals.len() > 1 {
+        eprintln!(
+            "{}",
+            catalog.format("cli.error.batch", &[("flag", "--java")])
+        );
+        return ExitCode::from(2);
+    }
+    let mut params = json!({});
+    if let Some(id) = parsed.positionals.first() {
+        params["id"] = json!(id);
+    }
+    let value = match call(catalog, "instance.java", params) {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    if parsed.flag("json") {
+        return print_json(&value);
+    }
+    println!("java = {}", field(&value, "java"));
+    if let Some(version) = value.get("version").and_then(Value::as_u64) {
+        println!("version = {version}");
+    }
+    println!("source = {}", field(&value, "source"));
+    ExitCode::SUCCESS
+}
+
 fn instance_list_values(catalog: &Catalog) -> Result<Vec<Value>, ExitCode> {
     let value = call(catalog, "instance.list", json!({}))?;
     Ok(value.as_array().cloned().unwrap_or_default())
@@ -2198,7 +2535,7 @@ fn instance_list_values(catalog: &Catalog) -> Result<Vec<Value>, ExitCode> {
 fn launch_command(args: &[String], catalog: &Catalog) -> ExitCode {
     let parsed = match parse_command_args(
         args,
-        &["list-sort", "list-sort-by", "account"],
+        &["list-sort", "list-sort-by", "prepare-download-threads"],
         &[],
         &[
             "list", "terminal", "prepare", "start", "stop", "json", "yes",
@@ -2211,6 +2548,54 @@ fn launch_command(args: &[String], catalog: &Catalog) -> ExitCode {
     if parsed.help {
         print!("{}", catalog.text("cli.help"));
         return ExitCode::SUCCESS;
+    }
+    if let Some(flag) = action_conflict(&parsed, &["stop", "start", "prepare", "terminal", "list"])
+    {
+        return unexpected(catalog, &format!("--{flag}"));
+    }
+    if parsed.flag("stop") {
+        if let Some(code) = reject_flags(
+            &parsed,
+            catalog,
+            &[
+                "account",
+                "prepare-download-threads",
+                "list-sort",
+                "list-sort-by",
+            ],
+        ) {
+            return code;
+        }
+    }
+    if parsed.flag("terminal") {
+        if let Some(code) = reject_flags(
+            &parsed,
+            catalog,
+            &[
+                "account",
+                "prepare-download-threads",
+                "list-sort",
+                "list-sort-by",
+            ],
+        ) {
+            return code;
+        }
+    }
+    if parsed.flag("prepare") || parsed.flag("start") {
+        if let Some(code) = reject_flags(&parsed, catalog, &["list-sort", "list-sort-by"]) {
+            return code;
+        }
+    }
+    if parsed.flag("list")
+        || (!parsed.flag("stop")
+            && !parsed.flag("start")
+            && !parsed.flag("prepare")
+            && !parsed.flag("terminal"))
+    {
+        if let Some(code) = reject_flags(&parsed, catalog, &["account", "prepare-download-threads"])
+        {
+            return code;
+        }
     }
     if parsed.flag("stop") {
         return launch_stop_action(&parsed, catalog);
@@ -2229,7 +2614,7 @@ fn launch_command(args: &[String], catalog: &Catalog) -> ExitCode {
 
 #[cfg(unix)]
 fn launch_list_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
-    let value = match call(catalog, "launch.status", json!({})) {
+    let value = match call(catalog, "launch.list", json!({})) {
         Ok(value) => value,
         Err(code) => return code,
     };
@@ -2270,7 +2655,7 @@ fn launch_stop_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     if parsed.positionals.is_empty() {
         return missing_flag(catalog, "<instance_id>");
     }
-    let value = match call(catalog, "launch.status", json!({})) {
+    let value = match call(catalog, "launch.list", json!({})) {
         Ok(value) => value,
         Err(code) => return code,
     };
@@ -2325,7 +2710,7 @@ fn launch_single_id(
 
 #[cfg(unix)]
 fn default_instance_id(catalog: &Catalog) -> Result<String, ExitCode> {
-    let value = call(catalog, "instance.get", json!({}))?;
+    let value = call(catalog, "instance.info", json!({}))?;
     let id = field(&value, "id").to_owned();
     if id.is_empty() {
         eprintln!("{}", catalog.text("cli.error.default_instance"));
@@ -2343,7 +2728,26 @@ fn resolve_instance(id: Option<String>, catalog: &Catalog) -> Result<String, Exi
 }
 
 #[cfg(unix)]
+fn prepare_download_threads(parsed: &CommandArgs, catalog: &Catalog) -> Result<u64, ExitCode> {
+    const DEFAULT: u64 = 8;
+    const MAX: u64 = 64;
+    match parsed.value("prepare-download-threads") {
+        None => Ok(DEFAULT),
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) if (1..=MAX).contains(&value) => Ok(value),
+            _ => {
+                eprintln!("{}", catalog.format("cli.error.threads", &[("value", raw)]));
+                Err(ExitCode::from(2))
+            }
+        },
+    }
+}
+
 fn launch_prepare_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    let threads = match prepare_download_threads(parsed, catalog) {
+        Ok(threads) => threads,
+        Err(code) => return code,
+    };
     let id = match launch_single_id(parsed, catalog, "--prepare") {
         Ok(id) => id,
         Err(code) => return code,
@@ -2352,15 +2756,16 @@ fn launch_prepare_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         Ok(id) => id,
         Err(code) => return code,
     };
-    let mut params = json!({ "id": id });
-    if let Some(account) = parsed.value("account") {
-        params["account"] = json!(account);
-    }
+    let params = json!({ "id": id, "download_threads": threads });
     finish(catalog, request(catalog, "launch.prepare", params))
 }
 
 #[cfg(unix)]
 fn launch_start_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+    let threads = match prepare_download_threads(parsed, catalog) {
+        Ok(threads) => threads,
+        Err(code) => return code,
+    };
     let id = match launch_single_id(parsed, catalog, "--start") {
         Ok(id) => id,
         Err(code) => return code,
@@ -2369,10 +2774,7 @@ fn launch_start_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         Ok(id) => id,
         Err(code) => return code,
     };
-    let mut params = json!({ "id": id });
-    if let Some(account) = parsed.value("account") {
-        params["account"] = json!(account);
-    }
+    let params = json!({ "id": id, "download_threads": threads });
     if let Err(code) = call(catalog, "launch.prepare", params.clone()) {
         return code;
     }
@@ -2404,43 +2806,245 @@ fn launch_terminal_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         Ok(id) => id,
         Err(code) => return code,
     };
+    if let Err(code) = call(catalog, "launch.terminal", json!({ "id": id })) {
+        return code;
+    }
     terminal_follow(&id, catalog)
 }
 
 #[cfg(unix)]
+struct ConsoleExit {
+    code: Option<i64>,
+    crashed: bool,
+    report: String,
+    had_output: bool,
+}
+
+#[cfg(unix)]
+struct TerminalGuard {
+    saved: Option<String>,
+    alternate: bool,
+}
+
+#[cfg(unix)]
+impl TerminalGuard {
+    fn enter(hint: &str, catalog: &Catalog) -> Self {
+        let inactive = || Self {
+            saved: None,
+            alternate: false,
+        };
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!("{}", catalog.text("cli.launch.terminal"));
+            return inactive();
+        }
+        let saved = Command::new("stty")
+            .arg("-g")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|saved| !saved.is_empty());
+        let Some(saved) = saved else {
+            eprintln!("{}", catalog.text("cli.launch.terminal"));
+            return inactive();
+        };
+        let applied = matches!(
+            Command::new("stty")
+                .args([
+                    "-icanon", "-echo", "-isig", "-ixon", "-icrnl", "min", "1", "time", "0"
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+            Ok(status) if status.success()
+        );
+        if !applied {
+            eprintln!("{}", catalog.text("cli.launch.terminal"));
+            return inactive();
+        }
+        print!("\x1b[?1049h\x1b[2J\x1b[H");
+        print_console_hint(hint);
+        Self {
+            saved: Some(saved),
+            alternate: true,
+        }
+    }
+
+    fn restore(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            let _ = Command::new("stty")
+                .arg(saved)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if self.alternate {
+            self.alternate = false;
+            print!("\x1b[?1049l");
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(unix)]
+fn print_console_hint(hint: &str) {
+    print!("\x1b[7m {hint} \x1b[0m\n\n> ");
+    let _ = std::io::stdout().flush();
+}
+
+#[cfg(unix)]
+fn send_console_input(id: &str, line: &str) {
+    let Ok(paths) = Paths::discover() else {
+        return;
+    };
+    let request =
+        arkmcl_platform::ipc::Request::new(1, "launch.input", json!({"id": id, "line": line}));
+    let _ = arkmcl_platform::ipc::call(&paths.socket(), &request);
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum ConsoleKey {
+    Detach,
+    Submit,
+    Backspace,
+    Clear,
+    Insert(u8),
+    Ignore,
+}
+
+#[cfg(unix)]
+fn console_key(byte: u8) -> ConsoleKey {
+    match byte {
+        0x18 | 0x03 | 0x04 => ConsoleKey::Detach,
+        b'\r' | b'\n' => ConsoleKey::Submit,
+        0x7f | 0x08 => ConsoleKey::Backspace,
+        0x0c => ConsoleKey::Clear,
+        byte if byte >= 0x20 => ConsoleKey::Insert(byte),
+        _ => ConsoleKey::Ignore,
+    }
+}
+
+#[cfg(unix)]
+fn terminal_input(id: &str, hint: &str, detach: &AtomicBool) {
+    use std::io::Read;
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut byte = [0u8; 1];
+    let mut line: Vec<u8> = Vec::new();
+    let mut skip = 0u8;
+    loop {
+        if detach.load(Ordering::SeqCst) {
+            break;
+        }
+        match reader.read(&mut byte) {
+            Ok(0) | Err(_) => {
+                detach.store(true, Ordering::SeqCst);
+                break;
+            }
+            Ok(_) => {}
+        }
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if byte[0] == 0x1b {
+            skip = 2;
+            continue;
+        }
+        match console_key(byte[0]) {
+            ConsoleKey::Detach => {
+                detach.store(true, Ordering::SeqCst);
+                break;
+            }
+            ConsoleKey::Submit => {
+                let text = String::from_utf8_lossy(&line).trim().to_owned();
+                line.clear();
+                if !text.is_empty() {
+                    send_console_input(id, &text);
+                }
+                print!("\n> ");
+                let _ = std::io::stdout().flush();
+            }
+            ConsoleKey::Backspace => {
+                if let Some(start) = line.iter().rposition(|byte| (*byte & 0xc0) != 0x80) {
+                    line.truncate(start);
+                    print!("\x08 \x08");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            ConsoleKey::Clear => {
+                print!("\x1b[2J\x1b[H");
+                print_console_hint(hint);
+                let _ = std::io::stdout().write_all(&line);
+                let _ = std::io::stdout().flush();
+            }
+            ConsoleKey::Insert(byte) => {
+                line.push(byte);
+                let _ = std::io::stdout().write_all(&[byte]);
+                let _ = std::io::stdout().flush();
+            }
+            ConsoleKey::Ignore => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_input_lines(id: &str) {
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        send_console_input(id, &line);
+    }
+}
+
+#[cfg(unix)]
 fn terminal_follow(id: &str, catalog: &Catalog) -> ExitCode {
-    eprintln!("{}", catalog.text("cli.launch.terminal"));
+    let hint = catalog.format("cli.launch.terminal_hint", &[("id", id)]);
+    let guard = TerminalGuard::enter(&hint, catalog);
+    let interactive = guard.alternate;
+    let detach = std::sync::Arc::new(AtomicBool::new(false));
     let input_id = id.to_owned();
+    let input_detach = std::sync::Arc::clone(&detach);
     thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            let Ok(paths) = Paths::discover() else {
-                break;
-            };
-            let request = arkmcl_platform::ipc::Request::new(
-                1,
-                "launch.input",
-                json!({"id": input_id, "line": line}),
-            );
-            let _ = arkmcl_platform::ipc::call(&paths.socket(), &request);
+        if interactive {
+            terminal_input(&input_id, &hint, &input_detach);
+        } else {
+            terminal_input_lines(&input_id);
         }
     });
     let mut cursor = 0u64;
+    let mut failure = None;
+    let mut exit = None;
     loop {
+        if detach.load(Ordering::SeqCst) {
+            break;
+        }
         let value = match call(
             catalog,
             "launch.output",
             json!({"id": id, "cursor": cursor}),
         ) {
             Ok(value) => value,
-            Err(code) => return code,
+            Err(code) => {
+                failure = Some(code);
+                break;
+            }
         };
         let chunk = field(&value, "output");
-        print!("{chunk}");
-        let _ = std::io::stdout().flush();
+        if !chunk.is_empty() {
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
+        }
         cursor = value
             .get("cursor")
             .and_then(Value::as_u64)
@@ -2450,42 +3054,58 @@ fn terminal_follow(id: &str, catalog: &Catalog) -> ExitCode {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let code = value.get("exit_code").and_then(Value::as_i64);
-            let crashed = value
-                .get("crashed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let report = field(&value, "crash_report");
-            if code.is_none() && chunk.is_empty() && !crashed {
-                eprintln!("{}", catalog.text("cli.launch.not_running"));
-                return ExitCode::from(1);
-            }
-            if let Some(code) = code {
-                println!(
-                    "{}",
-                    catalog.format("cli.launch.exit", &[("code", &code.to_string())])
-                );
-            } else {
-                println!("{}", catalog.text("cli.launch.exited"));
-            }
-            if crashed {
-                if report.is_empty() {
-                    eprintln!("{}", catalog.text("cli.launch.crashed"));
-                } else {
-                    eprintln!(
-                        "{}",
-                        catalog.format("cli.launch.crashed_report", &[("report", report)])
-                    );
-                }
-                return ExitCode::from(1);
-            }
-            return if code.unwrap_or(0) == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            };
+            exit = Some(ConsoleExit {
+                code: value.get("exit_code").and_then(Value::as_i64),
+                crashed: value
+                    .get("crashed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                report: field(&value, "crash_report").to_owned(),
+                had_output: !chunk.is_empty(),
+            });
+            break;
         }
         thread::sleep(Duration::from_millis(250));
+    }
+    let detached = detach.load(Ordering::SeqCst);
+    drop(guard);
+    if detached {
+        println!("{}", catalog.text("cli.launch.detached"));
+        return ExitCode::SUCCESS;
+    }
+    if let Some(code) = failure {
+        return code;
+    }
+    let Some(exit) = exit else {
+        return ExitCode::SUCCESS;
+    };
+    if exit.code.is_none() && !exit.had_output && !exit.crashed {
+        eprintln!("{}", catalog.text("cli.launch.not_running"));
+        return ExitCode::from(1);
+    }
+    if let Some(code) = exit.code {
+        println!(
+            "{}",
+            catalog.format("cli.launch.exit", &[("code", &code.to_string())])
+        );
+    } else {
+        println!("{}", catalog.text("cli.launch.exited"));
+    }
+    if exit.crashed {
+        if exit.report.is_empty() {
+            eprintln!("{}", catalog.text("cli.launch.crashed"));
+        } else {
+            eprintln!(
+                "{}",
+                catalog.format("cli.launch.crashed_report", &[("report", &exit.report)])
+            );
+        }
+        return ExitCode::from(1);
+    }
+    if exit.code.unwrap_or(0) == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -2495,7 +3115,6 @@ fn resource_command(args: &[String], catalog: &Catalog) -> ExitCode {
     let parsed = match parse_command_args(
         args,
         &[
-            "list-type",
             "filter-vanilla",
             "filter-version",
             "filter-loader",
@@ -2509,7 +3128,6 @@ fn resource_command(args: &[String], catalog: &Catalog) -> ExitCode {
             "list-limit",
             "list-sort",
             "list-sort-by",
-            "list-search",
             "game-version",
             "loader",
             "list-download-to-instance",
@@ -2532,15 +3150,38 @@ fn resource_command(args: &[String], catalog: &Catalog) -> ExitCode {
         print!("{}", catalog.text("cli.help"));
         return ExitCode::SUCCESS;
     }
+    if let Some(flag) = action_conflict(
+        &parsed,
+        &[
+            "autoremove",
+            "list-remote",
+            "search",
+            "lookup",
+            "download",
+            "download-mod",
+            "download-modpack",
+            "download-resourcepack",
+            "download-shader",
+            "download-datapack",
+            "download-world",
+            "download-plugin",
+            "list",
+        ],
+    ) {
+        return unexpected(catalog, &format!("--{flag}"));
+    }
+    if let Some(code) = validate_resource_actions(&parsed, catalog) {
+        return code;
+    }
     if parsed.flag("autoremove") {
         return resource_autoremove_action(&parsed, catalog);
     }
     if parsed.flag("list-remote") {
         let loaders = filtered_values(&parsed, "filter-loader");
         if loaders.is_empty() {
-            return resource_remote_action(&parsed, catalog);
+            return resource_list_remote_action(&parsed, catalog);
         }
-        return resource_loaders_action(&parsed, &loaders, catalog);
+        return resource_list_remote_loaders_action(&parsed, &loaders, catalog);
     }
     if let Some(query) = parsed.value("search") {
         let Some(kind) = parsed.value("type") else {
@@ -2581,9 +3222,6 @@ fn resource_command(args: &[String], catalog: &Catalog) -> ExitCode {
     if let Some((kind, id)) = selected.first() {
         return resource_download_action(&parsed, kind, id, catalog);
     }
-    if parsed.value("list-type").is_some() || parsed.value("list-search").is_some() {
-        return resource_list_action(&parsed, catalog);
-    }
     resource_local_list(&parsed, catalog)
 }
 
@@ -2600,7 +3238,7 @@ fn filtered_values(parsed: &CommandArgs, name: &str) -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn resource_remote_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
+fn resource_list_remote_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
     let sort_by = parsed.value("list-sort-by").unwrap_or("create");
     if !matches!(sort_by, "create" | "alphabet") {
         eprintln!(
@@ -2642,7 +3280,7 @@ fn resource_remote_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         }
         params["limit"] = json!(limit);
     }
-    let value = match call(catalog, "resource.versions", params) {
+    let value = match call(catalog, "resource.list_remote", params) {
         Ok(value) => value,
         Err(code) => return code,
     };
@@ -2670,7 +3308,7 @@ fn resource_remote_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
 }
 
 #[cfg(unix)]
-fn resource_loaders_action(
+fn resource_list_remote_loaders_action(
     parsed: &CommandArgs,
     loaders: &[String],
     catalog: &Catalog,
@@ -2716,7 +3354,7 @@ fn resource_loaders_action(
             }
             params["limit"] = json!(limit);
         }
-        let value = match call(catalog, "resource.loaders", params) {
+        let value = match call(catalog, "resource.list_remote_loaders", params) {
             Ok(value) => value,
             Err(code) => return code,
         };
@@ -2958,7 +3596,7 @@ fn resource_download_new(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
         if !loaders.is_empty() {
             params["loaders"] = json!(loaders);
         }
-        match call(catalog, "resource.install", params) {
+        match call(catalog, "resource.download", params) {
             Ok(value) => results.push(value),
             Err(code) => return code,
         }
@@ -3097,99 +3735,6 @@ fn resource_local_list(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
             "  [{}]  {}  {path}",
             field(&resource, "type"),
             field(&resource, "name")
-        );
-    }
-    ExitCode::SUCCESS
-}
-
-#[cfg(unix)]
-fn resource_list_action(parsed: &CommandArgs, catalog: &Catalog) -> ExitCode {
-    let kind = parsed.value("list-type");
-    if let Some(kind) = kind {
-        if !matches!(
-            kind,
-            "mod" | "modpack" | "resourcepack" | "shader" | "datapack" | "plugin" | "world"
-        ) {
-            eprintln!("{}", catalog.format("rpc.resource.kind", &[("kind", kind)]));
-            return ExitCode::from(2);
-        }
-    }
-    let limit = match parsed.value("list-limit") {
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(value) if (1..=100).contains(&value) => value,
-            _ => {
-                eprintln!(
-                    "{}",
-                    catalog.format("cli.resource.limit", &[("value", raw)])
-                );
-                return ExitCode::from(2);
-            }
-        },
-        None => 20,
-    };
-    let order = match parse_order(parsed, catalog) {
-        Ok(order) => order,
-        Err(code) => return code,
-    };
-    let sort_by = parsed.value("list-sort-by").unwrap_or("relevance");
-    if !matches!(sort_by, "create" | "download" | "name" | "relevance") {
-        eprintln!(
-            "{}",
-            catalog.format("cli.error.sort_key", &[("value", sort_by)])
-        );
-        return ExitCode::from(2);
-    }
-    let mut params = json!({
-        "limit": limit,
-        "sort_by": sort_by,
-        "order": if order { "asc" } else { "desc" },
-    });
-    if let Some(api) = parsed.value("api") {
-        params["api"] = json!(api);
-    }
-    if let Some(query) = parsed.value("list-search") {
-        params["query"] = json!(query);
-    }
-    if let Some(kind) = kind {
-        params["type"] = json!(kind);
-    }
-    let versions = parsed.all("game-version");
-    if !versions.is_empty() {
-        params["game_versions"] = json!(versions);
-    }
-    let loaders = parsed.all("loader");
-    if !loaders.is_empty() {
-        params["loaders"] = json!(loaders);
-    }
-    let value = match call(catalog, "resource.search", params) {
-        Ok(value) => value,
-        Err(code) => return code,
-    };
-    if parsed.flag("json") {
-        return print_json(&value);
-    }
-    let hits = value
-        .get("hits")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if hits.is_empty() {
-        println!("{}", catalog.text("cli.resource.empty"));
-        return ExitCode::SUCCESS;
-    }
-    for hit in hits {
-        let downloads = hit.get("downloads").and_then(Value::as_u64).unwrap_or(0);
-        let slug = field(&hit, "slug");
-        let id = if slug.is_empty() {
-            field(&hit, "project_id")
-        } else {
-            slug
-        };
-        println!(
-            "  {}  {}  {downloads}  {}",
-            field(&hit, "title"),
-            id,
-            field(&hit, "description")
         );
     }
     ExitCode::SUCCESS
@@ -3368,7 +3913,7 @@ fn complete_command(args: &[String]) -> ExitCode {
         "lang" => static_values(&["zh-CN", "en-US"]),
         "instance-ids" => complete_list("instance.list", &["id"]),
         "instance-names" => complete_list("instance.list", &["id", "name"]),
-        "account-names" => complete_list("account.list", &["id", "uuid", "name"]),
+        "account-names" => complete_list("account.list", &["id", "name"]),
         "groups" => complete_groups(),
         _ => Vec::new(),
     };
@@ -3443,7 +3988,7 @@ fn complete_call(method: &str) -> Option<Value> {
 }
 
 #[cfg(unix)]
-fn account_login_msa(catalog: &Catalog) -> ExitCode {
+fn account_login_msa(catalog: &Catalog, set_default: bool) -> ExitCode {
     let Ok(config) = msa::Config::from_env() else {
         eprintln!("{}", catalog.text("cli.msa.client"));
         return ExitCode::from(2);
@@ -3463,19 +4008,378 @@ fn account_login_msa(catalog: &Catalog) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    finish(
+    submit_account(
         catalog,
-        request(
+        json!({
+            "kind": "microsoft",
+            "name": login.profile.name,
+            "id": login.profile.id,
+            "access_token": login.access_token,
+            "refresh_token": login.refresh_token,
+        }),
+        set_default,
+    )
+}
+
+fn action_conflict(parsed: &CommandArgs, actions: &[&'static str]) -> Option<&'static str> {
+    let has = |name: &str| parsed.flag(name) || parsed.value(name).is_some();
+    if has("list") && actions.iter().any(|name| *name != "list" && has(name)) {
+        return Some("list");
+    }
+    let mut found = actions.iter().copied().filter(|name| has(name));
+    found.next()?;
+    found.next()
+}
+
+fn reject_flags(parsed: &CommandArgs, catalog: &Catalog, flags: &[&str]) -> Option<ExitCode> {
+    for flag in flags {
+        if parsed.flag(flag) || parsed.value(flag).is_some() {
+            return Some(unexpected(catalog, &format!("--{flag}")));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_lines)] // action validation table; split if more flags are added
+fn validate_instance_actions(parsed: &CommandArgs, catalog: &Catalog) -> Option<ExitCode> {
+    let read_only = [
+        "name",
+        "type",
+        "memory",
+        "jvm-args",
+        "java",
+        "version",
+        "lwjgl",
+        "loader",
+        "loader-version",
+        "account",
+        "group",
+        "link",
+        "create-defaults",
+        "move",
+        "group-move",
+        "import",
+        "list-sort",
+        "list-sort-by",
+    ];
+    if parsed.flag("info") || parsed.flag("default") || parsed.flag("remove") {
+        if let Some(code) = reject_flags(parsed, catalog, &read_only) {
+            return Some(code);
+        }
+    }
+    if parsed.flag("list") {
+        let list_forbidden = [
+            "name",
+            "type",
+            "memory",
+            "jvm-args",
+            "java",
+            "version",
+            "lwjgl",
+            "loader",
+            "loader-version",
+            "account",
+            "link",
+            "create-defaults",
+            "move",
+            "group-move",
+            "import",
+        ];
+        if let Some(code) = reject_flags(parsed, catalog, &list_forbidden) {
+            return Some(code);
+        }
+    }
+    let move_forbidden = [
+        "name",
+        "type",
+        "memory",
+        "jvm-args",
+        "java",
+        "version",
+        "lwjgl",
+        "loader",
+        "loader-version",
+        "account",
+        "group",
+        "link",
+        "create-defaults",
+        "import",
+        "list-sort",
+        "list-sort-by",
+    ];
+    if parsed.value("move").is_some() || parsed.value("group-move").is_some() {
+        if let Some(code) = reject_flags(parsed, catalog, &move_forbidden) {
+            return Some(code);
+        }
+    }
+    if parsed.flag("create") {
+        if let Some(code) = reject_flags(
+            parsed,
             catalog,
-            "account.add",
-            json!({
-                "kind": "microsoft",
-                "name": login.profile.name,
-                "uuid": login.profile.id,
-                "access_token": login.access_token,
-                "refresh_token": login.refresh_token,
-            }),
-        ),
+            &["import", "move", "group-move", "list-sort", "list-sort-by"],
+        ) {
+            return Some(code);
+        }
+    }
+    if parsed.value("import").is_some() {
+        let import_forbidden = [
+            "memory",
+            "jvm-args",
+            "java",
+            "version",
+            "lwjgl",
+            "loader",
+            "loader-version",
+            "account",
+            "create-defaults",
+            "move",
+            "group-move",
+            "list-sort",
+            "list-sort-by",
+        ];
+        if let Some(code) = reject_flags(parsed, catalog, &import_forbidden) {
+            return Some(code);
+        }
+    }
+    if !parsed.flag("list")
+        && !parsed.flag("info")
+        && !parsed.flag("default")
+        && !parsed.flag("remove")
+        && !parsed.flag("create")
+        && parsed.value("import").is_none()
+        && parsed.value("move").is_none()
+        && parsed.value("group-move").is_none()
+    {
+        if let Some(code) = reject_flags(parsed, catalog, &["list-sort", "list-sort-by"]) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+fn typed_download(parsed: &CommandArgs) -> bool {
+    [
+        "download-mod",
+        "download-modpack",
+        "download-resourcepack",
+        "download-shader",
+        "download-datapack",
+        "download-world",
+        "download-plugin",
+    ]
+    .iter()
+    .any(|flag| parsed.value(flag).is_some())
+}
+
+#[allow(clippy::too_many_lines)] // flag validation table; split if more actions are added
+fn validate_resource_actions(parsed: &CommandArgs, catalog: &Catalog) -> Option<ExitCode> {
+    let all_values = [
+        "filter-vanilla",
+        "filter-version",
+        "filter-loader",
+        "type",
+        "api",
+        "lookup",
+        "download",
+        "download-version",
+        "download-to-instance",
+        "search",
+        "list-limit",
+        "list-sort",
+        "list-sort-by",
+        "game-version",
+        "loader",
+        "list-download-to-instance",
+        "download-mod",
+        "download-modpack",
+        "download-resourcepack",
+        "download-shader",
+        "download-datapack",
+        "download-world",
+        "download-plugin",
+    ];
+    if parsed.flag("autoremove") {
+        return reject_flags(parsed, catalog, &all_values);
+    }
+    if parsed.flag("list-remote") {
+        if filtered_values(parsed, "filter-loader").is_empty() {
+            return reject_flags(
+                parsed,
+                catalog,
+                &[
+                    "filter-loader",
+                    "type",
+                    "api",
+                    "lookup",
+                    "download",
+                    "download-version",
+                    "download-to-instance",
+                    "search",
+                    "game-version",
+                    "loader",
+                    "list-download-to-instance",
+                    "download-mod",
+                    "download-modpack",
+                    "download-resourcepack",
+                    "download-shader",
+                    "download-datapack",
+                    "download-world",
+                    "download-plugin",
+                    "yes",
+                ],
+            );
+        }
+        return reject_flags(
+            parsed,
+            catalog,
+            &[
+                "filter-vanilla",
+                "list-sort-by",
+                "type",
+                "api",
+                "lookup",
+                "download",
+                "download-version",
+                "download-to-instance",
+                "search",
+                "game-version",
+                "loader",
+                "list-download-to-instance",
+                "download-mod",
+                "download-modpack",
+                "download-resourcepack",
+                "download-shader",
+                "download-datapack",
+                "download-world",
+                "download-plugin",
+                "yes",
+            ],
+        );
+    }
+    if parsed.value("search").is_some() {
+        return reject_flags(
+            parsed,
+            catalog,
+            &[
+                "filter-vanilla",
+                "lookup",
+                "download",
+                "download-version",
+                "download-to-instance",
+                "game-version",
+                "loader",
+                "list-download-to-instance",
+                "download-mod",
+                "download-modpack",
+                "download-resourcepack",
+                "download-shader",
+                "download-datapack",
+                "download-world",
+                "download-plugin",
+                "yes",
+            ],
+        );
+    }
+    if parsed.value("lookup").is_some() {
+        return reject_flags(
+            parsed,
+            catalog,
+            &[
+                "filter-vanilla",
+                "type",
+                "download",
+                "download-version",
+                "download-to-instance",
+                "search",
+                "list-limit",
+                "list-sort",
+                "list-sort-by",
+                "game-version",
+                "loader",
+                "list-download-to-instance",
+                "download-mod",
+                "download-modpack",
+                "download-resourcepack",
+                "download-shader",
+                "download-datapack",
+                "download-world",
+                "download-plugin",
+                "yes",
+            ],
+        );
+    }
+    if !parsed.all("download").is_empty() {
+        return reject_flags(
+            parsed,
+            catalog,
+            &[
+                "filter-vanilla",
+                "lookup",
+                "search",
+                "list-limit",
+                "list-sort",
+                "list-sort-by",
+                "game-version",
+                "loader",
+                "list-download-to-instance",
+                "download-mod",
+                "download-modpack",
+                "download-resourcepack",
+                "download-shader",
+                "download-datapack",
+                "download-world",
+                "download-plugin",
+                "yes",
+            ],
+        );
+    }
+    if typed_download(parsed) {
+        return reject_flags(
+            parsed,
+            catalog,
+            &[
+                "download",
+                "download-version",
+                "type",
+                "api",
+                "filter-vanilla",
+                "filter-version",
+                "filter-loader",
+                "list-limit",
+                "list-sort",
+                "list-sort-by",
+                "search",
+                "lookup",
+                "yes",
+            ],
+        );
+    }
+    reject_flags(
+        parsed,
+        catalog,
+        &[
+            "filter-vanilla",
+            "filter-version",
+            "filter-loader",
+            "type",
+            "api",
+            "lookup",
+            "download",
+            "download-version",
+            "download-to-instance",
+            "search",
+            "game-version",
+            "loader",
+            "list-download-to-instance",
+            "download-mod",
+            "download-modpack",
+            "download-resourcepack",
+            "download-shader",
+            "download-datapack",
+            "download-world",
+            "download-plugin",
+            "yes",
+        ],
     )
 }
 
@@ -3557,5 +4461,30 @@ mod tests {
         assert_eq!(field(selected[0], "id"), "a");
         sort_values(&mut selected, "create", false, &catalog).expect("desc sort");
         assert_eq!(field(selected[0], "id"), "a");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod console_key_tests {
+    use super::{ConsoleKey, console_key};
+
+    #[test]
+    fn detach_keys_match_nano_style_exit() {
+        assert_eq!(console_key(0x18), ConsoleKey::Detach);
+        assert_eq!(console_key(0x03), ConsoleKey::Detach);
+        assert_eq!(console_key(0x04), ConsoleKey::Detach);
+    }
+
+    #[test]
+    fn editing_and_submit_keys_are_stable() {
+        assert_eq!(console_key(b'\r'), ConsoleKey::Submit);
+        assert_eq!(console_key(b'\n'), ConsoleKey::Submit);
+        assert_eq!(console_key(0x7f), ConsoleKey::Backspace);
+        assert_eq!(console_key(0x08), ConsoleKey::Backspace);
+        assert_eq!(console_key(0x0c), ConsoleKey::Clear);
+        assert_eq!(console_key(b'a'), ConsoleKey::Insert(b'a'));
+        assert_eq!(console_key(0xe4), ConsoleKey::Insert(0xe4));
+        assert_eq!(console_key(0x01), ConsoleKey::Ignore);
+        assert_eq!(console_key(0x1b), ConsoleKey::Ignore);
     }
 }

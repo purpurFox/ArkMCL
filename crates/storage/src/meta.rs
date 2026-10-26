@@ -6,7 +6,7 @@
 //! - `$MINECRAFT_HOME/assets/indexes/<index-id>.json`
 //! - `$MINECRAFT_HOME/assets/indexes/loaders/fabric/<game>-<loader>.json`
 //!
-//! 安装器写入的 `versions/<id>/<id>.json` 与旧版清单路径只作为回退读取。
+//! 安装器写入的 `versions/<id>/<id>.json` 作为回退读取。
 
 use std::fmt;
 use std::io;
@@ -90,25 +90,7 @@ impl<F: FileSystem> Cache<F> {
     ///
     /// 文件无法读取或 JSON 非法时返回错误。
     pub fn manifest(&self) -> Result<Option<Manifest>, Error> {
-        if let Some(manifest) = self.read(&self.manifest_path())? {
-            return Ok(Some(manifest));
-        }
-        self.read(&self.legacy_manifest_path())
-    }
-
-    /// 新位置是否已有版本清单。
-    #[must_use]
-    pub fn manifest_exists(&self) -> bool {
-        self.fs.exists(&self.manifest_path())
-    }
-
-    /// 读取旧位置的版本清单，用于一次性迁移。
-    ///
-    /// # Errors
-    ///
-    /// 文件无法读取或 JSON 非法时返回错误。
-    pub fn legacy_manifest(&self) -> Result<Option<Manifest>, Error> {
-        self.read(&self.legacy_manifest_path())
+        self.read(&self.manifest_path())
     }
 
     /// 写入版本清单。
@@ -229,13 +211,6 @@ impl<F: FileSystem> Cache<F> {
     #[must_use]
     pub fn manifest_path(&self) -> PathBuf {
         self.indexes_root().join("version_manifest_v2.json")
-    }
-
-    /// 旧版版本清单路径，仅用于迁移读取。
-    fn legacy_manifest_path(&self) -> PathBuf {
-        self.minecraft
-            .join("assets")
-            .join("version_manifest_v2.json")
     }
 
     fn version_path(&self, id: &str) -> PathBuf {
